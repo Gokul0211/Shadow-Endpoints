@@ -938,7 +938,7 @@ class ASTCallGraph:
             rv = self._evaluate(node.right, depth + 1)
             if lv is not None and rv is not None:
                 return lv + rv
-            # FIX EP-B-016: an unresolved *named* operand (a plain identifier —
+            # an unresolved *named* operand (a plain identifier —
             # e.g. a function parameter with no known call-site value, like
             # `id` in BASE+"/api/admin/users/"+id+"/role") was previously
             # dropped instead of placeholdered, silently deleting a path

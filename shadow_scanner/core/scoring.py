@@ -4,12 +4,15 @@ Confidence scoring.
 * LibraryFingerprint      - is this source file third-party/vendor code?
 * EndpointClassifier      - hard-garbage gate (XML/binary/unresolved base vars)
 * BayesianConfidenceScorer - THE single unified scorer.  Produces tiers
-  VERIFIED_API (>=85) / BACKEND_API (55-84) / LOW_CONFIDENCE (30-54) with
+  HIGH_CONFIDENCE (>=85) / BACKEND_API (55-84) / LOW_CONFIDENCE (30-54) with
+  (VERIFIED_API is reserved for requests observed in browser traffic)
   Wilson 95% CIs and data-driven LR calibration.  Route every new signal
   through this class - do not introduce a competing scorer.
 """
 import re
 from collections import defaultdict
+
+from shadow_scanner.core.evidence import is_runtime
 # ==============================================================================
 # CLASS: LIBRARY FINGERPRINT (Identify Vendor Code)
 # ==============================================================================
@@ -135,8 +138,8 @@ class BayesianConfidenceScorer:
     # Override at class level before scanning to adjust for target density.
     PRIOR: float = 0.35
 
-    # ── Tier thresholds (must match paper Table II + SPABench reporting) ─────
-    TIER_VERIFIED:      int = 85   # VERIFIED_API
+    # ── Tier thresholds (must match paper Table II) ─────
+    TIER_VERIFIED:      int = 85   # HIGH_CONFIDENCE (name kept for compatibility)
     TIER_BACKEND:       int = 55   # BACKEND_API
     TIER_LOW_CONF:      int = 30   # LOW_CONFIDENCE
     # Below TIER_LOW_CONF → NOISE_CANDIDATE (filtered from output)
@@ -158,7 +161,11 @@ class BayesianConfidenceScorer:
         'url_builder':        3.5,   # IMPL-2: URL builder functions
         'promise_chain':      3.0,   # IMPL-2: Promise chain fetch
         'computed_http_call': 4.0,   # IMPL-1: api["get"]("/path")
-        'ws_dynamic':         4.5,   # IMPL-2: Dynamic WebSocket URL
+        'websocket_url':      4.5,   # WebSocket URL in client code (literal or built)
+        # Provisional (Phase A): server-declared routes (OpenAPI, Actuator, WSDL,
+        # Next.js server manifest, GraphQL introspection). Replaced by learned
+        # weights in Phase E.
+        'schema_declared':    9.0,
         'apq_persisted':      5.0,   # IMPL-6: APQ persisted queries
         'interceptor_base':   3.5,   # IMPL-2: axios interceptor baseURL
         'rtk_query':          5.5,   # G10: RTK Query / React Query / SWR
@@ -219,21 +226,25 @@ class BayesianConfidenceScorer:
         'REACT_USE_EFFECT_FETCH':       ['react_useeffect'],
         'SOAP_BRIDGE_CALL':             ['soap_bridge'],
         'SOAP_ACTION':                  ['soap_bridge'],
-        'SOAP_BRIDGE_CALL_DYNAMIC':     ['soap_bridge', 'verified_dynamic'],
-        # Storage / cache
+        # Storage / cache (a URL found in IndexedDB is not observed traffic)
         'INDEXEDDB_CACHE_KEY':          ['indexeddb_cache'],
-        'INDEXEDDB_CACHED_URL':         ['indexeddb_cache', 'verified_dynamic'],
+        'INDEXEDDB_CACHED_URL':         ['indexeddb_cache'],
+        # Server-declared routes (see core/evidence.py SPEC_TYPES)
+        'OPENAPI_SPEC':                 ['schema_declared'],
+        'ACTUATOR_ENDPOINT':            ['schema_declared'],
+        'WSDL_OPERATION':               ['schema_declared', 'soap_bridge'],
         # New IMPL types
-        'NEXTJS_API_ROUTE':             ['nextjs_route', 'verified_dynamic'],
+        'NEXTJS_API_ROUTE':             ['nextjs_route', 'schema_declared'],
         'NEXTJS_API_PROBE':             ['nextjs_route'],
         'SW_PRECACHE_ROUTE':            ['sw_proxy_route'],
         'SW_RESPOND_WITH':              ['sw_proxy_route'],
         'URL_BUILDER_FUNC':             ['url_builder'],
         'PROMISE_CHAIN_FETCH':          ['promise_chain'],
         'PROMISE_CHAIN_AXIOS':          ['promise_chain'],
-        'WEBSOCKET_DYNAMIC_CONCAT':     ['ws_dynamic'],
-        'WEBSOCKET_DYNAMIC_VAR':        ['ws_dynamic'],
-        'WEBSOCKET_STATIC_LITERAL':     ['verified_dynamic'],
+        'WEBSOCKET_DYNAMIC_CONCAT':     ['websocket_url'],
+        'WEBSOCKET_DYNAMIC_VAR':        ['websocket_url'],
+        'WEBSOCKET_STATIC_LITERAL':     ['websocket_url'],
+        'WEBSOCKET':                    ['websocket_url'],
         # UPGRADE: New runtime interception types
         'RUNTIME_SSE':                  ['verified_dynamic'],
         'RUNTIME_BEACON':               ['verified_dynamic'],
@@ -261,14 +272,17 @@ class BayesianConfidenceScorer:
         'TRPC_PROCEDURE':               ['trpc_procedure'],
         'TRPC_NESTED_PROCEDURE':        ['trpc_procedure'],
         'NUXT_SERVER_ROUTE':            ['nuxt_server_route'],
-        'GRAPHQL_QUERY':                ['gql_tag'],
-        'GRAPHQL_MUTATION':             ['gql_tag'],
-        'GRAPHQL_SUBSCRIPTION':         ['gql_tag'],
+        'GQL_TAG_QUERY':                ['gql_tag'],          # client code
+        'GQL_TAG_MUTATION':             ['gql_tag'],
+        'GQL_TAG_SUBSCRIPTION':         ['gql_tag'],
+        'GRAPHQL_QUERY':                ['schema_declared'],  # server introspection
+        'GRAPHQL_MUTATION':             ['schema_declared'],
+        'GRAPHQL_SUBSCRIPTION':         ['schema_declared'],
         'ENV_VAR_CONCAT':               ['env_var_concat'],
         'TANSTACK_ROUTE':               ['tanstack_route'],
         'INTERNAL_IP_HARDCODED':        ['internal_ip'],
         'RPC_3PART_CONCAT':             ['rpc_call'],
-        'SW_WEB_WORKER':               ['web_worker', 'verified_dynamic'],
+        'SW_WEB_WORKER':               ['web_worker'],
         'GRAPHQL_APQ_ENDPOINT':        ['apq_persisted'],
     }
 
@@ -277,7 +291,9 @@ class BayesianConfidenceScorer:
         signals = []
         et = (extraction_type or '').upper()
         signals.extend(cls._ET_MAP.get(et, []))
-        if 'DYNAMIC' in et or 'VERIFIED' in et:
+        # Only requests actually observed in browser traffic are runtime-verified
+        # (core/evidence.py). Type names are never matched by substring.
+        if is_runtime(et):
             signals.append('verified_dynamic')
         if is_vendor:
             signals.append('vendor_source')
@@ -302,9 +318,6 @@ class BayesianConfidenceScorer:
             signals.append('single_word')
         if method and method.upper() in ('POST', 'PUT', 'DELETE', 'PATCH'):
             signals.append('non_get_method')
-        # WebSocket URLs always get verified_dynamic treatment
-        if (url or '').startswith(('wss://', 'ws://')):
-            signals.append('verified_dynamic')
         return signals
 
     @classmethod
@@ -349,7 +362,7 @@ class BayesianConfidenceScorer:
 
         score_int = min(100, max(1, round(p * 100)))
         if score_int >= cls.TIER_VERIFIED:
-            cat = 'VERIFIED_API'
+            cat = 'HIGH_CONFIDENCE'      # high score, NOT observed at runtime
         elif score_int >= cls.TIER_BACKEND:
             cat = 'BACKEND_API'
         elif score_int >= cls.TIER_LOW_CONF:
@@ -377,7 +390,7 @@ class BayesianConfidenceScorer:
 
         Wilson CI is preferred over the naive p ± z*sqrt(p(1-p)/n) because it
         remains well-calibrated when k=0, k=n, or n is small — all of which
-        occur in SPABench evaluation where per-technique sample sizes are small.
+        occur in benchmark evaluation where per-technique sample sizes are small.
 
         Args:
             k: Number of successes (true positives, or correct classifications).
@@ -406,7 +419,7 @@ class BayesianConfidenceScorer:
         """Derive likelihood ratios from labelled ground-truth data using MLE.
 
         This method implements data-driven LR estimation as an alternative to
-        the practitioner-assigned priors in cls.LR.  It operates on SPABench
+        the practitioner-assigned priors in cls.LR.  It operates on benchmark
         ground-truth labels and produces per-signal LR estimates with
         Laplace-smoothed MLE.
 
@@ -515,7 +528,7 @@ class BayesianConfidenceScorer:
 
         Produces the statistical summary required for academic reporting.
         When ``ground_truth_tps`` is provided (a set of known-TP URLs, e.g.
-        from SPABench evaluate.py), also computes per-tier precision with 95%
+        from a benchmark evaluator), also computes per-tier precision with 95%
         Wilson CIs.
 
         Args:

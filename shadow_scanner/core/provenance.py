@@ -1,5 +1,7 @@
 """Endpoint provenance graph: multi-source confirmation + audit trail."""
 from collections import defaultdict
+
+from shadow_scanner.core.evidence import evidence_kind
 # ==============================================================================
 # ENDPOINT PROVENANCE GRAPH
 # Tracks the evidence chain for each endpoint across all discovery sources.
@@ -30,56 +32,42 @@ class EndpointProvenanceGraph:
         'SCHEMA':    0.95,
         'CONFIG':    0.85,
         'SOURCEMAP': 0.80,
+        'PROBE':     0.70,
         'STATIC':    0.65,
         'STORAGE':   0.75,
         'UNKNOWN':   0.40,
     }
 
-    # Map extraction types → provenance category
-    _ET_TO_CATEGORY = {
-        # Runtime
-        'DYNAMIC_XHR_INTERCEPT': 'RUNTIME', 'DYNAMIC_API_CALL': 'RUNTIME',
-        'WEBSOCKET_DYNAMIC':     'RUNTIME', 'INDEXEDDB_CACHED_URL': 'RUNTIME',
-        'SW_RESPOND_WITH':       'RUNTIME', 'NEXTJS_API_PROBE': 'RUNTIME',
-        # Schema
-        'GRAPHQL_QUERY':         'SCHEMA',  'GRAPHQL_MUTATION': 'SCHEMA',
-        'GRAPHQL_SUBSCRIPTION':  'SCHEMA',  'OPENAPI_ENDPOINT': 'SCHEMA',
-        'JSDOC_OPENAPI':         'SCHEMA',  'JSDOC_OPENAPI_PATH': 'SCHEMA',
-        'ACTUATOR_ENDPOINT':     'SCHEMA',
-        # Config
-        'JSON_CONFIG':           'CONFIG',  'ENVIRONMENT_URL': 'CONFIG',
-        'NEXTJS_API_ROUTE':      'CONFIG',  'NEXTJS_FILE_ROUTE': 'CONFIG',
-        'NEXTJS_COMMENT_ROUTE':  'CONFIG',
-        # Sourcemap
-        'SOURCEMAP_RECOVERY':    'SOURCEMAP',
-        # Storage
-        'SW_PRECACHE_ROUTE':     'STORAGE', 'INDEXEDDB_CACHE_KEY': 'STORAGE',
-        'LOCALSTORAGE_API_KEY':  'STORAGE',
-    }
+    _KIND_TO_CATEGORY = {'runtime': 'RUNTIME', 'spec': 'SCHEMA', 'probe': 'PROBE', 'storage': 'STORAGE'}
+    _CONFIG_TYPES = frozenset({'JSON_CONFIG', 'ENVIRONMENT_URL', 'ENV_VAR_CONCAT'})
+    _MAP_SOURCE_EXT = ('.ts', '.tsx', '.jsx', '.vue', '.svelte', '.mts', '.cts')
 
     def __init__(self):
         # url_key → list of evidence records
         self._graph: dict[str, list[dict]] = defaultdict(list)
 
     @staticmethod
-    def _category(extraction_type: str) -> str:
+    def _category(extraction_type: str, source: str = '') -> str:
+        """Where the evidence came from: RUNTIME / SCHEMA / PROBE / STORAGE by
+        evidence kind (core/evidence.py); for client code, SOURCEMAP when the
+        code was recovered from a source map, CONFIG for configuration values,
+        else STATIC."""
+        kind = evidence_kind(extraction_type)
+        if kind in EndpointProvenanceGraph._KIND_TO_CATEGORY:
+            return EndpointProvenanceGraph._KIND_TO_CATEGORY[kind]
         et = (extraction_type or '').upper()
-        for key, cat in EndpointProvenanceGraph._ET_TO_CATEGORY.items():
-            if et.startswith(key):
-                return cat
-        # Heuristic fallback
-        if 'DYNAMIC' in et or 'RUNTIME' in et or 'VERIFIED' in et:
-            return 'RUNTIME'
-        if 'SOURCEMAP' in et or 'TS_SERVICE' in et:
+        src = (source or '').replace('\\', '/').lower()
+        if (et.startswith('SOURCEMAP') or '/sourcemaps/' in src
+                or src.split('?')[0].endswith(EndpointProvenanceGraph._MAP_SOURCE_EXT)):
             return 'SOURCEMAP'
-        if 'CONFIG' in et or 'ENVIRON' in et or 'JSON' in et:
+        if et in EndpointProvenanceGraph._CONFIG_TYPES or src.split('?')[0].endswith('.json'):
             return 'CONFIG'
         return 'STATIC'
 
     def record(self, url: str, extraction_type: str, source: str, confidence: int):
         """Record one piece of evidence for an endpoint."""
         key = url.rstrip('/')
-        cat = self._category(extraction_type)
+        cat = self._category(extraction_type, source)
         self._graph[key].append({
             'type':       extraction_type,
             'source':     source,
@@ -94,15 +82,16 @@ class EndpointProvenanceGraph:
         if not evidence:
             return {'categories': [], 'sources': 0, 'multi_source': False,
                     'provenance_boost': 0, 'best_category': 'UNKNOWN'}
-        cats      = list({e['category'] for e in evidence})
+        cats      = sorted({e['category'] for e in evidence})
         sources   = len(evidence)
-        best_cat  = max(cats, key=lambda c: self.WEIGHTS.get(c, 0))
+        best_cat  = max(cats, key=lambda c: (self.WEIGHTS.get(c, 0), c))
         # Multi-source boost: +10 per unique category beyond the first (max +30)
         boost     = min(30, (len(cats) - 1) * 10)
         return {
             'categories':       cats,
             'sources':          sources,
-            'multi_source':     sources > 1,
+            # independent confirmation = more than one category of evidence
+            'multi_source':     len(cats) > 1,
             'provenance_boost': boost,
             'best_category':    best_cat,
             'evidence':         evidence[:5],  # cap for JSON size

@@ -53,17 +53,73 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # CONFIGURATION
 # ==============================================================================
 
+# Third-party hosts (analytics, monitoring, public CDNs, social widgets, XML /
+# schema namespaces). Matched as a host or a subdomain of it — never as a
+# substring of the URL, which used to drop first-party traffic on
+# *.azurewebsites.net, CloudFront-hosted bundles and Firebase (googleapis.com).
 IGNORED_DOMAINS = [
-    "google", "facebook", "twitter", "linkedin", "sentry", "datadog", "newrelic",
-    "segment", "hotjar", "optimizely", "intercom", "cloudflare", "cloudfront",
-    "jsdelivr", "cdnjs", "unpkg", "microsoftonline", "azure", "chinacloudapi",
-    "opencagedata", "tinymce", "w3.org", "gstatic", "bootstrapcdn", "fontawesome",
-    "vimeo.com", "vzaar.com",
-    "reactjs.org", "react.dev",
-    "openxmlformats.org", "schemas.openxmlformats.org",
-    "schemas.microsoft.com", "schema.org",
-    "mozilla.org", "mdn.",
+    # analytics / ads / tag managers
+    "google-analytics.com", "googletagmanager.com", "doubleclick.net",
+    "googlesyndication.com", "google.com", "gstatic.com",
+    "fonts.googleapis.com", "maps.googleapis.com",
+    "facebook.com", "facebook.net", "twitter.com", "linkedin.com",
+    "hotjar.com", "hotjar.io", "optimizely.com", "segment.com", "segment.io",
+    # monitoring / support widgets
+    "sentry.io", "sentry-cdn.com", "datadoghq.com", "datadoghq.eu", "newrelic.com", "nr-data.net",
+    "intercom.io", "intercomcdn.com", "cloudflareinsights.com",
+    # public CDNs / library hosts / media
+    "jsdelivr.net", "cdnjs.cloudflare.com", "unpkg.com", "bootstrapcdn.com", "fontawesome.com",
+    "tiny.cloud", "tinymce.com", "vimeo.com", "vzaar.com", "opencagedata.com",
+    # identity provider login pages (reported as SSO links, not app endpoints)
+    "login.microsoftonline.com",
+    # XML / schema namespaces and documentation sites
+    "w3.org", "schema.org", "openxmlformats.org", "schemas.microsoft.com", "xmlns.com", "purl.org",
+    "mozilla.org", "reactjs.org", "react.dev",
 ]
+
+
+def is_ignored_host(host: str) -> bool:
+    """True if host is one of IGNORED_DOMAINS or a subdomain of one."""
+    h = (host or '').lower().split(':')[0].strip('.')
+    return any(h == d or h.endswith('.' + d) for d in IGNORED_DOMAINS)
+
+
+# Well-known-path probing (COMMON_ENDPOINTS, OpenAPI/Actuator/Next.js paths,
+# GraphQL paths, service-worker names, .d.ts guesses). --no-probe sets this to
+# False; URLs the target's own code references are still fetched.
+PROBING_ENABLED = True
+
+
+def site_of(host: str) -> str:
+    """Registrable-domain approximation: last two labels (whole host for IPs / localhost)."""
+    h = (host or '').lower().split(':')[0].strip('.')
+    labels = h.split('.')
+    if len(labels) < 2 or re.fullmatch(r'[\d.]+', h):
+        return h
+    return '.'.join(labels[-2:])
+
+
+def is_first_party(url: str, target: str) -> bool:
+    """Same host as the target (any port) or a subdomain of the target's site."""
+    import urllib.parse
+    try:
+        h = (urllib.parse.urlparse(url).hostname or '').lower()
+        t = (urllib.parse.urlparse(target).hostname or '').lower()
+    except ValueError:
+        return False
+    if not h or not t:
+        return False
+    site = site_of(t)
+    return h == t or h == site or h.endswith('.' + site)
+
+
+def is_ignored_url(url: str) -> bool:
+    """True if the URL's host is a third-party host (see is_ignored_host)."""
+    import urllib.parse
+    try:
+        return is_ignored_host(urllib.parse.urlparse(url if '//' in (url or '') else '//' + (url or '')).hostname or '')
+    except ValueError:
+        return False
 
 # ==============================================================================
 # UNIFIED BLOCKLIST — single source of truth for all noise filtering.
@@ -98,16 +154,6 @@ _BLOCKED_KEYWORDS: list[str] = [
     'elliptic', 'browserify-sign', 'create-ecdh', 'browserify-cipher',
     'public-encrypt', 'diffie-hellman', 'create-hmac',
     'pbkdf2', 'randombytes', 'randomfill',
-    # FIX FP-5 / TC-NOISE-007: React component names that leak as paths
-    # These appear in React DevTools / error boundaries but are NOT API endpoints.
-    '/productcard', '/checkoutform', '/userprofile', '/orderhistory',
-    '/paymentgateway', '/admindashboard', '/inventorytable', '/reportgenerator',
-    '/notificationcenter',
-    # FIX FP-5 / TC-NOISE-008: SPA router navigation paths (frontend routes, not APIs)
-    # These are navigated by the frontend router and never hit the backend directly.
-    # Note: only block the exact noise manifest examples, not their sub-paths.
-    '/user/profile/settings', '/settings/notifications/preferences',
-    '/team/members/invite', '/billing/plans/upgrade',
 ]
 
 _BLOCKED_PATTERNS: list[str] = [
@@ -151,16 +197,10 @@ _BLOCKED_PATTERNS: list[str] = [
     r'/[a-z]$',
     # Error messages in path
     r'caused by:', r'valid digit info', r'animation-timing-function',
-    # FP FIX: Angular/React SPA frontend router paths that leak from source maps.
-    # These are client-side navigation routes, NOT backend API endpoints.
-    # Pattern: single-segment paths with no /api/ prefix that are pure nouns/views.
-    # /dashboard, /users, /admin (as root) are frontend routes; /api/users is fine.
-    r'^https?://[^/]+/dashboard$',
-    r'^https?://[^/]+/users$',
-    r'^https?://[^/]+/users/\{[^}]+\}$',
-    # Angular Module Federation lazy-load path artifacts from app-routing.module.ts
-    # e.g. http://localhost:3002/mfeUsers/UsersModule — this is a loadChildren() string
-    r'/mfe[A-Z][a-zA-Z]+/[A-Z][a-zA-Z]+Module$',
+    # Case-sensitive (scoped (?-i:…) so is_blocked_pattern's IGNORECASE does not apply):
+    # Angular lazy-load strings whose last segment is an NgModule class name,
+    # e.g. "./admin/admin.module#AdminModule" resolved to …/admin/AdminModule
+    r'(?-i:/[A-Z][A-Za-z0-9]*Module)$',
 ]
 
 # Pre-compile for performance — used by the helpers below
@@ -206,9 +246,6 @@ API_INDICATORS = [
     r'/admin', r'/user', r'/auth',
     r'/dashboard', r'/master', r'/project',
     r'^#/', r'^/#/',
-    # RC1-FIX: Match api_service/method style paths (no leading slash, underscore-separated service names)
-    # e.g. api_rc_simops/CheckSimops, api_isolationtemplate/getAllIsolationTemplates
-    r'^api_[a-z_]+/',
 ]
 
 HASH_ROUTE_PATTERNS = [

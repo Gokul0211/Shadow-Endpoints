@@ -83,6 +83,11 @@ Examples:
                         help='Path to scan cache file (default: no cache). Enables resume support. '
                              'Note: file content is not persisted to disk, so --resume skips re-fetching '
                              'only for files already in memory from the current session.')
+    parser.add_argument('--no-probe', action='store_true',
+                        help='Do not request well-known paths that nothing references (common API '
+                             'paths, OpenAPI/Actuator/WSDL/Next.js/GraphQL locations, service-worker '
+                             'names, .d.ts guesses). URLs the target\'s code references are still '
+                             'fetched. Probe-derived findings are always tagged as such in the report.')
     parser.add_argument('--resume', action='store_true',
                         help='Resume a previous scan using the cache file specified by --cache. '
                              'Skips already-fetched JS files. Requires --cache.')
@@ -108,7 +113,7 @@ Examples:
     auth_group.add_argument('--api-login-url', type=str, default=None,
                             help='Direct API login endpoint. Use when --login-url is a '
                                  'SPA frontend route that returns 405 on POST. '
-                                 'Example: http://localhost:4001/api/auth/login')
+                                 'Example: https://api.example.com/api/auth/login')
 
     return parser.parse_args()
 
@@ -320,6 +325,10 @@ def main():
     try:
         # Parse command-line arguments
         args = parse_args()
+        if args.no_probe:
+            from shadow_scanner import config
+            config.PROBING_ENABLED = False
+            print("[*] Probing disabled (--no-probe)")
         target = _resolve_target(args)
         _check_connectivity(target)
         session = _build_session()

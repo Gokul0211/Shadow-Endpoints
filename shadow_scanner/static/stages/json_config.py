@@ -4,7 +4,7 @@ import re
 
 import requests
 
-from shadow_scanner.config import API_INDICATORS, IGNORED_DOMAINS, NOISE_KEYWORDS, NOISE_PATTERNS
+from shadow_scanner.config import API_INDICATORS, NOISE_KEYWORDS, NOISE_PATTERNS, is_ignored_url
 class JsonConfigMixin:
     """Endpoint extraction from JSON config files (environment.json etc.)."""
 
@@ -80,7 +80,7 @@ class JsonConfigMixin:
                 return "BACKEND_API"
 
         if value.startswith('http'):
-            if not any(d in v for d in IGNORED_DOMAINS):
+            if not is_ignored_url(v):
                 return "EXTERNAL_API"
 
         if (value.startswith('/') or value.startswith('#/')) and len(value) > 3:

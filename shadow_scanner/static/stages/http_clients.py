@@ -57,7 +57,7 @@ class HttpClientPatternsMixin:
 
     def _extract_named_axios_calls(self, code, source):
         """Module-level axios.create() instances: apiClient.post("/path")."""
-        # ── Named axios instance calls (EP-C-003 fix) ────────────────────────
+        # ── Named axios instance calls ────────────────────────
         # Catches: axiosInstance.post('/checkout/process', body)
         #          apiClient.get('/api/users', config)
         #          httpClient.delete('/api/items/1')

@@ -122,7 +122,7 @@ class EnhancedRPCExtractor:
                     })
 
         # Pattern 4: Method calls with concatenation
-        pattern4 = re.compile(r'(?:get|post|put|delete|patch|fetch|postDataFromUrl|getDataFromUrl|postDataFromUrlWithoutSerialize|getDataFromUrlAndSendData|getRawDataFromUrl)\s*\(\s*([a-zA-Z_$][a-zA-Z0-9_$.]*)\s*\+\s*["\']([^"\']+)["\']', re.IGNORECASE)
+        pattern4 = re.compile(r'(?:get|post|put|delete|patch|fetch)\s*\(\s*([a-zA-Z_$][a-zA-Z0-9_$.]*)\s*\+\s*["\']([^"\']+)["\']', re.IGNORECASE)
         for match in pattern4.finditer(code):
             var_name = match.group(1)
             suffix = match.group(2)
@@ -134,16 +134,22 @@ class EnhancedRPCExtractor:
 
             if base_url:
                 full_endpoint = base_url + suffix
+                # base + "/users/" + id  → the code itself appends a value after
+                # the literal, so the path continues with a parameter segment.
+                if suffix.endswith('/') and re.match(r'\s*\+\s*[A-Za-z_$(]', code[match.end():match.end() + 12]):
+                    full_endpoint += '{param}'
                 if self._is_valid_endpoint(full_endpoint):
                     ctx_before = code[max(0, match.start()-50):match.start()]
                     method = self._extract_method_from_context(ctx_before, code[match.start():match.start()+20])
-                    # Use _emit_with_param_variant to also emit /{id} variant for
-                    # collection endpoints like /api/users/ → /api/users/{id}
-                    self._emit_with_param_variant(
-                        found, full_endpoint, method,
-                        f'{var_name} + "{suffix}"',
-                        'RPC_HTTP_CALL', filename, 'RPC_ENDPOINT', 95
-                    )
+                    found.append({
+                        'endpoint': full_endpoint,
+                        'method': method,
+                        'pattern': f'{var_name} + "{suffix}"',
+                        'type': 'RPC_HTTP_CALL',
+                        'source': filename,
+                        'classification': 'RPC_ENDPOINT',
+                        'confidence': 95
+                    })
 
         # Pattern 5: Chained concatenation
         pattern5 = re.compile(r'([a-zA-Z_$][a-zA-Z0-9_$.]*)\s*\+\s*["\']([^"\']+)["\']\s*\+\s*["\']([^"\']+)["\']')
@@ -225,7 +231,7 @@ class EnhancedRPCExtractor:
         # This pattern captures: base + 'prefix/' + <dynamic> + '/suffix'
         # and emits: base + prefix/{param}/suffix
         pattern4b = re.compile(
-            r'(?:get|post|put|delete|patch|fetch|postDataFromUrl|getDataFromUrl)\s*'
+            r'(?:get|post|put|delete|patch|fetch)\s*'
             r'\(\s*([a-zA-Z_$][a-zA-Z0-9_$.]*)\s*\+\s*["\'`]([^"\'`]{2,80}/)["\'`]'
             r'\s*\+\s*[a-zA-Z_$][a-zA-Z0-9_$.]*'
             r'\s*\+\s*["\'`](/[^"\'`]{1,80})["\'`]',
@@ -239,10 +245,10 @@ class EnhancedRPCExtractor:
                 continue
             base_url = self.resolver.resolve_with_fallback(base_var)
             if base_url:
-                # Reconstruct with {id} placeholder for the dynamic segment
+                # Reconstruct with a placeholder for the dynamic segment
                 full_endpoint = (base_url.rstrip('/')
                                  + '/' + prefix_path.strip('/')
-                                 + '/{id}'
+                                 + '/{param}'
                                  + suffix_path)
                 if self._is_valid_endpoint(full_endpoint):
                     ctx_before = code[max(0, match.start()-50):match.start()]
@@ -258,58 +264,23 @@ class EnhancedRPCExtractor:
                         'confidence':     85,
                     })
 
-        # Pattern 8: Direct string literal in custom HTTP wrappers (RC4-FIX)
-        # Catches: postDataFromUrl('api_rc_simops/CheckSimops', data)
-        # Unlike Pattern 4 this does NOT require variable concatenation - the path is a raw string.
-        # Anchored strictly to known custom HTTP wrappers to avoid false positives.
-        pattern8 = re.compile(
-            r'(?:postDataFromUrl|getDataFromUrl|postDataFromUrlWithoutSerialize'
-            r'|getDataFromUrlAndSendData|getRawDataFromUrl)\s*\(\s*["\']'
-            r'((?:api_[a-z_]+/|/api)[^"\'<>{}\s]{3,100})["\']',
-            re.IGNORECASE
-        )
-        for match in pattern8.finditer(code):
-            raw_path = match.group(1)
-            if self._is_noise('', raw_path):
-                continue
-            # Ensure a leading slash. The extractor has no URLNormalizer of its own:
-            # every caller (scan() step 2, analyze_code_from_dynamic) normalizes
-            # each returned endpoint to a full URL. The previous
-            # self.normalizer.normalize() call raised AttributeError and aborted
-            # the whole scan whenever this pattern matched.
-            full_endpoint = raw_path if raw_path.startswith('/') else '/' + raw_path
-            if self._is_valid_endpoint(full_endpoint):
-                ctx_before = code[max(0, match.start()-50):match.start()]
-                method = self._extract_method_from_context(ctx_before, code[match.start():match.start()+20])
-                found.append({
-                    'endpoint': full_endpoint,
-                    'method': method,
-                    'pattern': f'direct("{raw_path}")',
-                    'type': 'RPC_DIRECT_STRING',
-                    'source': filename,
-                    'classification': 'RPC_ENDPOINT',
-                    'confidence': 88
-                })
-
-        # Pattern 9: Service-property suffix scan (RC5-FIX)
-        # For each resolved service property whose value contains 'api_', scan code
-        # for ALL concatenations: this.PROP + "suffix", `${this.PROP}suffix`
-        # This catches the ~25 endpoints missed by Patterns 1-4 because those patterns
-        # require specific code contexts (object literal, HTTP call, template literal)
-        # but Angular services often use arbitrary variable concatenation.
+        # Pattern 9: service-property suffix scan
+        # For each service property / variable whose value is a URL base
+        # (absolute, or a path ending in "/"), find every concatenation
+        # this.PROP + "suffix" and `${this.PROP}suffix` in the code.
         api_service_bases = {}
-        for prop_name, prop_data in self.resolver.service_properties.items():
+        for prop_name, prop_data in sorted(self.resolver.service_properties.items()):
             base_val = prop_data.get('endpoint', '')
-            if base_val and 'api_' in base_val.lower():
+            if self._looks_like_base(base_val):
                 api_service_bases[prop_name] = base_val
 
-        # Also check variables dict for api_ base URLs stored as this.X
-        for var_name, var_data in self.resolver.variables.items():
+        for var_name, var_data in sorted(self.resolver.variables.items()):
             val = var_data.get('value', '') if isinstance(var_data, dict) else str(var_data)
-            if val and re.match(r'.*api_[a-z_]+/?$', val):
-                clean_name = var_name.replace('this.', '')
-                if clean_name not in api_service_bases:
-                    api_service_bases[clean_name] = val
+            if not var_name.startswith('this.') or not self._looks_like_base(val):
+                continue
+            clean_name = var_name.replace('this.', '')
+            if clean_name not in api_service_bases:
+                api_service_bases[clean_name] = val
 
         if api_service_bases:
             for prop_name, base_url in api_service_bases.items():
@@ -392,7 +363,7 @@ class EnhancedRPCExtractor:
                         'confidence':     95
                     })
 
-        # FIX EP-B-003: Pattern 11 — this.http.get/post(this.propA + this.propB, ...)
+        # Pattern 11 — this.http.get/post(this.propA + this.propB, ...)
         # Catches: this.http.get(this.apiBase + this.inventoryEndpoint, {params:q})
         # where both this.propA and this.propB are string literals resolvable by resolver.
         _P11_RE = re.compile(
@@ -423,44 +394,11 @@ class EnhancedRPCExtractor:
 
         return found
 
-    # FIX PATH-PARAM: For endpoints ending with /, also emit {id} variant.
-    # Covers patterns like: this.http.get(base + '/users/' + id) where the
-    # variable `id` is not a string literal — the tool finds the base only.
-    def _emit_with_param_variant(self, found_list, endpoint, method, pattern,
-                                  ep_type, source, classification, confidence):
-        """Emit an endpoint, plus a {id} variant ONLY when the source literal
-        ends with a trailing slash — i.e. the code explicitly supplies a bare
-        collection path like '/api/users/' without an id segment, strongly
-        suggesting the developer intended it to accept an id parameter."""
-        found_list.append({
-            'endpoint':       endpoint,
-            'method':         method,
-            'pattern':        pattern,
-            'type':           ep_type,
-            'source':         source,
-            'classification': classification,
-            'confidence':     confidence
-        })
-        # FP5 FIX: Only emit {id} variant when the original endpoint actually
-        # ends with '/'.  Endpoints like '/api/users' (no trailing slash) are
-        # full paths — generating '/api/users/{id}' from them is speculation.
-        if not endpoint.endswith('/'):
-            return
-        clean = endpoint.rstrip('/')
-        if clean and any(
-            seg in clean.split('/')[-1].lower()
-            for seg in ('user', 'order', 'product', 'permit', 'item',
-                        'record', 'entry', 'report', 'doc', 'file')
-        ):
-            found_list.append({
-                'endpoint':       clean + '/{id}',
-                'method':         method,
-                'pattern':        pattern + ' + /{id}',
-                'type':           ep_type,
-                'source':         source,
-                'classification': classification,
-                'confidence':     max(30, confidence - 20),
-            })
+    @staticmethod
+    def _looks_like_base(value):
+        """An absolute URL, or a path that ends in "/" (a base other strings are appended to)."""
+        return bool(value) and (value.startswith(('http://', 'https://'))
+                                or (value.startswith('/') and value.endswith('/')))
 
     def _is_valid_endpoint(self, endpoint):
         """Validate if endpoint looks legitimate - AGGRESSIVE FILTERING"""
@@ -514,8 +452,8 @@ class EnhancedRPCExtractor:
         if endpoint.startswith('ORIGIN'):
             endpoint = endpoint.replace('ORIGIN', '/')
 
-        # Must start with valid protocol or path, OR be an api_ path
-        if not (endpoint.startswith('http') or endpoint.startswith('/') or endpoint.startswith('#/') or re.match(r'^api_[a-z_]+/', endpoint)):
+        # Must start with a protocol or a path
+        if not (endpoint.startswith('http') or endpoint.startswith('/') or endpoint.startswith('#/')):
             return False
 
         # Validation for http URLs

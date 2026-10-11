@@ -21,6 +21,16 @@ class URLNormalizer:
         self.scheme = parsed.scheme
         self.netloc = parsed.netloc
         self.base_path = parsed.path.rstrip('/')
+        # Base for relative references ("api/users"): the document's directory,
+        # or its <base href> once set_base_href() is called - like a browser.
+        self.document_base = f'{self.scheme}://{self.netloc}{self.base_path}/'
+
+    def set_base_href(self, href):
+        """Use the page's <base href> for relative references."""
+        if href:
+            self.document_base = urllib.parse.urljoin(self.document_base, href)
+            if not self.document_base.endswith('/'):
+                self.document_base = self.document_base.rsplit('/', 1)[0] + '/'
 
     def normalize(self, endpoint):
         """Convert endpoint to complete URL with path-param normalization."""
@@ -41,7 +51,9 @@ class URLNormalizer:
         elif '#/' in endpoint:
             full = f'{self.scheme}://{self.netloc}/{endpoint}'
         else:
-            full = f'{self.scheme}://{self.netloc}/{endpoint}'
+            # relative reference ("api/users", "./config.json"): resolved against
+            # the document base, not the host root
+            full = urllib.parse.urljoin(self.document_base, endpoint)
 
         # ── Step 2: Normalize path parameters ─────────────────────────────
         try:

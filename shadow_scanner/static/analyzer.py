@@ -11,8 +11,6 @@ The class itself only holds state and the two orchestrators:
 
 Each technique lives in a mixin under static/stages/.
 """
-from collections import defaultdict
-
 from shadow_scanner.config import LOW_VALUE_JS
 from shadow_scanner.core.provenance import EndpointProvenanceGraph
 from shadow_scanner.core.rate_limiter import RateLimiter
@@ -65,7 +63,8 @@ class EnhancedStaticAnalyzer(
         self.base_url = base_url
         self.normalizer = URLNormalizer(base_url)
         self.endpoints = []
-        self.confidence_scores = defaultdict(int)
+        self._index = {}               # normalised URL -> record in self.endpoints
+        self.current_phase = '2'       # set by pipeline.py; stored on every evidence item
         self.resolver = EnhancedVariableResolver()
         self.rpc_extractor = EnhancedRPCExtractor(self.resolver)
         self.analyzed_js_files = set()
@@ -147,7 +146,6 @@ class EnhancedStaticAnalyzer(
 
         # URL-builder functions
         self._extract_interprocedural_calls(code, source)
-        self._expand_api_versions(code, source)
 
         # Call sites, sockets, SOAP
         self._extract_router_navigation(code, source)
@@ -228,8 +226,11 @@ class EnhancedStaticAnalyzer(
 
     def analyze_code_from_dynamic(self, code, source):
         """
-        Special method for analyzing code discovered during dynamic phase.
-        This is called from the feedback loop.
+        Analyze code that arrived after Phase 2 (feedback loop, module bodies,
+        remotes, source-map sources): register its variables, run the RPC
+        patterns, then analyze_code(). Everything found here is STATIC evidence
+        - the code was fetched, not executed - so extraction types are kept
+        as-is (no "_DYNAMIC" suffix; see core/evidence.py).
         """
         filename = source.split('/')[-1] if '/' in source else source
 
@@ -244,7 +245,7 @@ class EnhancedStaticAnalyzer(
                 full_url,
                 ep['method'],
                 [],
-                ep['type'] + '_DYNAMIC',
+                ep['type'],
                 ep['source'],
                 ep['classification'],
                 ep['confidence']

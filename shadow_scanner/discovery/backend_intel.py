@@ -5,6 +5,8 @@ import os
 import re
 import urllib.parse
 
+from shadow_scanner import config
+from shadow_scanner.config import is_first_party
 from shadow_scanner.discovery.sourcemaps import run_sourcemap_harvest
 # ==============================================================================
 # EXPOSED API INTELLIGENCE HARVESTER
@@ -67,24 +69,19 @@ class BackendFileHunter:
     ]
 
     WSDL_PATHS = [
-        'api/legacy/bridge/?wsdl',
-        'api/legacy/bridge?wsdl',
         'api/soap?wsdl',
         'api/ws?wsdl',
         'services?wsdl',
         '?wsdl',
         'wsdl',
         'service.wsdl',
-        # FIX EP-D: common WSDL file paths that the scanner may have found as
-        # literal URL strings in the bundle (e.g. WSDL_URL="/wsdl/legacy-service.wsdl")
-        'wsdl/legacy-service.wsdl',
         'wsdl/service.wsdl',
-        'wsdl/LegacyService.wsdl',
-        'wsdl/legacy.wsdl',
         'api/wsdl',
         'soap/wsdl',
-        'legacy/service.wsdl',
     ]
+    # WSDL documents the client itself references (a literal such as
+    # "/wsdl/HrService.wsdl" or "…?wsdl" in any analysed bundle) are probed too.
+    _WSDL_LITERAL_RE = re.compile(r'''["'`]([^"'`\s]*(?:\.wsdl|\?wsdl)(?:\?[^"'`\s]*)?)["'`]''', re.IGNORECASE)
 
     def __init__(self, session, base_url, output_dir=None, analyzer=None):
         self.session    = session
@@ -107,9 +104,20 @@ class BackendFileHunter:
 
         self._init_spa_fingerprint()
 
-        # RC2-FIX: Collect additional API base URLs from the analyzer's resolver.
-        # The resolver discovers URLs like http://localhost:4001/api/rc_permit/ via
-        # environmentApiUrl patterns. We should probe swagger/actuator on those hosts too.
+        if not config.PROBING_ENABLED:
+            # --no-probe: no well-known-path wordlists; only WSDL documents that
+            # the target's own code references are fetched.
+            print("  [--no-probe] well-known path probing disabled")
+            _saved_paths, self.WSDL_PATHS = self.WSDL_PATHS, []
+            print("\n  [SOAP WSDL] (referenced by the code only)")
+            wsdl_eps = self._probe_wsdl()
+            self.WSDL_PATHS = _saved_paths
+            print(f"    -> {wsdl_eps} operation(s) extracted from WSDL")
+            return self.findings
+
+        # Collect additional API base URLs from the analyzer's resolver
+        # (environment / config URLs). Only first-party hosts (same host or a
+        # subdomain of the target's site) are probed - never third parties.
         _extra_base_urls = set()
         if self.analyzer and hasattr(self.analyzer, 'resolver'):
             resolver = self.analyzer.resolver
@@ -135,6 +143,8 @@ class BackendFileHunter:
                     except Exception:
                         pass
 
+        _extra_base_urls = {u for u in _extra_base_urls if is_first_party(u, self.base_url)}
+
         print("\n  [BACKEND SOURCE MAPS]")
         sm_found = self._probe_backend_source_maps()
         print(f"    -> {sm_found} map(s) found and fed into source-map pipeline")
@@ -142,7 +152,7 @@ class BackendFileHunter:
         print("\n  [OPENAPI / SWAGGER]")
         oa_eps, oa_specs = self._probe_openapi()
         # RC2-FIX: Also probe extra API hosts for swagger specs
-        for api_base in _extra_base_urls:
+        for api_base in sorted(_extra_base_urls):
             saved_base = self.base_url
             self.base_url = api_base
             _extra_eps, _extra_specs = self._probe_openapi()
@@ -154,10 +164,8 @@ class BackendFileHunter:
         print("\n  [SPRING ACTUATOR /mappings]")
         ac_eps = self._probe_actuator_mappings()
         # RC2-FIX: Also probe extra API hosts for actuator
-        # FIX EP-B-006: _extra_base_urls may not include self.base_url (SPA port).
-        # Some Spring Boot SPAs serve actuator on the same port as the SPA
-        # (e.g. localhost:3002/actuator/mappings). We always probe self.base_url
-        # first (already done above), then probe all extra hosts.
+        # Some deployments proxy the actuator through the SPA's own origin, so
+        # self.base_url is probed first (above), then every extra API host.
         _all_actuator_hosts = set(_extra_base_urls)
         # Also probe any host discovered from static analysis endpoints that
         # differs from self.base_url — catches cases where MFE bundles reference
@@ -169,27 +177,14 @@ class BackendFileHunter:
                     try:
                         p = urllib.parse.urlparse(ep_url)
                         candidate = f"{p.scheme}://{p.netloc}"
-                        if candidate != self.base_url:
+                        if candidate != self.base_url and is_first_party(candidate, self.base_url):
                             _all_actuator_hosts.add(candidate)
                     except Exception:
                         pass
-        # FIX EP-B-006: SPABench standard port layout has SPA on 3xxx and
-        # rest-backend on 4xxx. When base_url is localhost:3NNN, also probe
-        # localhost:4001 through localhost:4004 since the actuator endpoint
-        # may be on the backend port with no static-analysis signal pointing there.
-        try:
-            _spa_parsed = urllib.parse.urlparse(self.base_url)
-            _spa_port = _spa_parsed.port or 80
-            if _spa_parsed.hostname in ('localhost', '127.0.0.1') and 3000 <= _spa_port <= 3099:
-                for _backend_port in range(4001, 4005):
-                    _backend_candidate = f"{_spa_parsed.scheme}://{_spa_parsed.hostname}:{_backend_port}"
-                    _all_actuator_hosts.add(_backend_candidate)
-        except Exception:
-            pass
-        for api_base in _all_actuator_hosts:
+        for api_base in sorted(_all_actuator_hosts):
             saved_base = self.base_url
             self.base_url = api_base
-            ac_eps += self._probe_actuator_mappings(spa_origin=saved_base)
+            ac_eps += self._probe_actuator_mappings()
             self.base_url = saved_base
         print(f"    -> {ac_eps} route(s) extracted from actuator")
 
@@ -283,10 +278,28 @@ class BackendFileHunter:
 
         return count
 
+    def _referenced_wsdl(self):
+        """{host: [path, …]} for WSDL URLs written in the analysed JS (absolute or
+        relative to the target)."""
+        out = {}
+        contents = getattr(self.analyzer, 'js_contents', None) or {}
+        for code in list(contents.values()):
+            for m in self._WSDL_LITERAL_RE.finditer(code or ''):
+                full = urllib.parse.urljoin(self.base_url + '/', m.group(1))
+                pu = urllib.parse.urlparse(full)
+                if not pu.scheme.startswith('http'):
+                    continue
+                host = f"{pu.scheme}://{pu.netloc}"
+                path = pu.path.lstrip('/') + (('?' + pu.query) if pu.query else '')
+                out.setdefault(host, [])
+                if path not in out[host]:
+                    out[host].append(path)
+        return out
+
     def _probe_wsdl(self):
         """
-        Probe for SOAP WSDL files on the SPA host AND on any API backend hosts
-        discovered from environment variables (e.g. localhost:4001, localhost:4004).
+        Probe for SOAP WSDL files on the SPA host, on API hosts found in the
+        analysed configuration, and at WSDL URLs the client code references.
 
         Parses <operation name="..."> elements and emits each as POST bridgeBase/op.
         Returns count of endpoints added.
@@ -306,21 +319,16 @@ class BackendFileHunter:
                     except Exception:
                         pass
 
-        # FIX EP-D-002/003/004: when base_url is localhost:3xxx, also probe
-        # localhost:4001-4004 for WSDL. The SOAP bridge in SPABench runs on
-        # port 4004 while the SPA is on 3004 — no static signal connects them.
-        try:
-            _sp = urllib.parse.urlparse(self.base_url)
-            if _sp.hostname in ('localhost', '127.0.0.1') and 3000 <= (_sp.port or 80) <= 3099:
-                for _bp in range(4001, 4005):
-                    _bh = f"{_sp.scheme}://{_sp.hostname}:{_bp}"
-                    if _bh not in hosts_to_probe:
-                        hosts_to_probe.append(_bh)
-        except Exception:
-            pass
+        referenced = self._referenced_wsdl()
+        for _h in referenced:
+            if _h not in hosts_to_probe:
+                hosts_to_probe.append(_h)
 
         for host in hosts_to_probe:
-            for path in self.WSDL_PATHS:
+            # the well-known-path list only on first-party hosts; WSDL URLs the
+            # code itself references on any host
+            wordlist = self.WSDL_PATHS if is_first_party(host, self.base_url) else []
+            for path in wordlist + [p for p in referenced.get(host, []) if p not in wordlist]:
                 url = f"{host}/{path.lstrip('/')}"
                 try:
                     r = self.session.get(url, timeout=8, verify=False,
@@ -348,7 +356,7 @@ class BackendFileHunter:
                     if not op_names:
                         continue
 
-                    # FIX EP-D: Derive bridge base from the WSDL soap:address location
+                    # Derive the bridge base from the WSDL soap:address location
                     # element (e.g. <soap:address location="http://localhost:4004/api/legacy/bridge"/>)
                     # rather than from the WSDL URL path itself (which may be /wsdl/legacy-service.wsdl).
                     # Fall back: check if the host has a known /api/legacy/bridge path pattern,
@@ -379,7 +387,7 @@ class BackendFileHunter:
                     # 3. Probe common bridge paths on the same host
                     if not soap_base:
                         host_base = urllib.parse.urlparse(url).scheme + '://' + urllib.parse.urlparse(url).netloc
-                        for bridge_path in ['/api/legacy/bridge', '/api/bridge', '/api/soap/bridge', '/legacy/bridge']:
+                        for bridge_path in ['/api/bridge', '/api/soap/bridge', '/soap/bridge']:
                             probe_url = host_base + bridge_path
                             try:
                                 pr = self.session.head(probe_url, timeout=4, verify=False, allow_redirects=False)
@@ -838,15 +846,11 @@ class BackendFileHunter:
 
     # ---- Category 3: Spring Actuator /mappings -------------------------------
 
-    def _probe_actuator_mappings(self, spa_origin=None):
+    def _probe_actuator_mappings(self):
         """
         Fetches Spring Boot Actuator /actuator/mappings and parses every
         handler mapping into the endpoint pool.
 
-        spa_origin: when probing a cross-host backend (e.g. localhost:4001 while
-        scanning localhost:3002), pass the original SPA base URL here. The function
-        will also emit ACTUATOR_MAPPINGS_ROOT at spa_origin/actuator/mappings so that
-        the benchmark target (EP-B-006: localhost:3002/actuator/mappings) is found.
 
         Spring Boot 2.x response structure:
           {
@@ -880,7 +884,7 @@ class BackendFileHunter:
         for path in self.ACTUATOR_MAPPINGS_PATHS:
             url = f"{self.base_url}/{path.lstrip('/')}"
             try:
-                # FIX EP-B-006: Some SPAs serve actuator on the same port and rely on
+                # Some SPAs serve actuator on the same origin and rely on
                 # content negotiation to distinguish actuator requests from SPA requests.
                 # Always request with Accept: application/json so Spring Boot returns JSON
                 # instead of the SPA catch-all HTML.
@@ -925,28 +929,6 @@ class BackendFileHunter:
                     )
                     total_added += 1
 
-                    # EP-B-006 FIX: When the actuator is found at a cross-host port
-                    # (e.g. scanning localhost:3002 but actuator at localhost:4001),
-                    # ALSO emit the ROOT at the SPA host's /actuator/mappings path.
-                    # The benchmark expects the actuator endpoint at the SPA port because
-                    # that is the attack surface that a security scanner maps.
-                    if spa_origin and spa_origin.rstrip('/') != self.base_url.rstrip('/'):
-                        try:
-                            _spa_actuator_url = (
-                                spa_origin.rstrip('/') + '/' + path.lstrip('/')
-                            )
-                            self.analyzer.add_endpoint(
-                                url            = _spa_actuator_url,
-                                method         = 'GET',
-                                params         = [],
-                                type           = 'ACTUATOR_MAPPINGS_ROOT',
-                                source         = url,
-                                classification = 'BACKEND_API',
-                                confidence     = 90,
-                            )
-                            total_added += 1
-                        except Exception:
-                            pass
 
                 local_path = self._save_file(r, path, "actuator")
                 added = self._parse_actuator_mappings(data, source=url)
@@ -1047,7 +1029,7 @@ class BackendFileHunter:
                     # Prepend the origin of the actuator probe URL so that
                     # evaluate.py can match the full URL.  `source` is e.g.
                     # http://localhost:4001/actuator/mappings, so _api_origin
-                    # becomes http://localhost:4001 — matching the manifest.
+                    # becomes http://localhost:4001.
                     try:
                         _sp = urllib.parse.urlparse(source)
                         _api_origin = f"{_sp.scheme}://{_sp.netloc}"
@@ -1059,8 +1041,6 @@ class BackendFileHunter:
                     # the extracted routes belong to the shared backend, not the target SPA.
                     # Tag them as ACTUATOR_ENDPOINT_CROSS_HOST at reduced confidence so they
                     # are visible in the report but don't count as target-app endpoints.
-                    # The actuator ROOT endpoint (ACTUATOR_MAPPINGS_ROOT) is already emitted
-                    # at full confidence by the caller — that IS the benchmark target (EP-B-006).
                     try:
                         _source_parsed = urllib.parse.urlparse(source)
                         _scan_base_parsed = urllib.parse.urlparse(self.base_url)

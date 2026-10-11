@@ -1,6 +1,7 @@
 """GraphQL endpoint discovery: introspection + persisted-query (APQ) probing."""
 import re
 import urllib.parse
+from shadow_scanner import config
 class GraphQLIntrospector:
     """
     Automatically discovers and introspects GraphQL endpoints.
@@ -77,7 +78,7 @@ class GraphQLIntrospector:
         # Previously, /graphql was probed in Phase 1 as a common endpoint but
         # the 200 result went into json_configs, NOT into discovered_endpoints.
         # So this scan() never saw it as a candidate.
-        if self.base_url:
+        if self.base_url and config.PROBING_ENABLED:
             common_gql_paths = [
                 '/graphql', '/gql', '/api/graphql', '/v1/graphql',
                 '/api/gql', '/graphql/v1', '/query', '/api/query',
@@ -94,7 +95,8 @@ class GraphQLIntrospector:
                         try:
                             api_host = urllib.parse.urlparse(val)
                             base_parsed = urllib.parse.urlparse(self.base_url)
-                            if api_host.port != base_parsed.port:
+                            if (api_host.port != base_parsed.port
+                                    and config.is_first_party(val, self.base_url)):
                                 gql_base = f"{api_host.scheme}://{api_host.netloc}"
                                 for path in common_gql_paths:
                                     candidate = f"{gql_base}{path}"
@@ -102,26 +104,6 @@ class GraphQLIntrospector:
                                         graphql_candidates.append(candidate)
                         except Exception:
                             pass
-
-            # Only probe alternate localhost ports when the target itself is a
-            # localhost / loopback address.  On real production hosts these ports
-            # are almost never open and the probes generate spurious noise plus
-            # unwanted outbound connections.
-            try:
-                _bp = urllib.parse.urlparse(self.base_url)
-                _base_port = _bp.port or 80
-                _is_local = _bp.hostname in ('localhost', '127.0.0.1', '::1')
-                if _is_local:
-                    for _api_port in (4001, 4002, 4003, 4004):
-                        if _api_port == _base_port:
-                            continue
-                        _alt_base = f"{_bp.scheme}://{_bp.hostname}:{_api_port}"
-                        for path in common_gql_paths:
-                            candidate = f"{_alt_base}{path}"
-                            if candidate not in graphql_candidates:
-                                graphql_candidates.append(candidate)
-            except Exception:
-                pass
 
         print(f"  Found {len(graphql_candidates)} potential GraphQL endpoints")
 

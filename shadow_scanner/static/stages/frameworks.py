@@ -5,7 +5,7 @@ class FrameworkPatternsMixin:
 
     def _extract_nextjs_routes(self, code, source):
         """Next.js "// METHOD /api/..." route comments and pages/api file routes."""
-        # ── Next.js API route comment extraction (EP-E /api/auth, /api/users) ─
+        # ── Next.js API route comment extraction (e.g. /api/auth, /api/users) ─
         # Next.js /pages/api/*.ts files often have leading comments documenting routes:
         #   // POST /api/auth/login
         #   // GET /api/users/[id]
@@ -17,7 +17,7 @@ class FrameworkPatternsMixin:
         for m in _NEXTJS_COMMENT_RE.finditer(code):
             method_str = m.group(1).upper()
             raw_path   = m.group(2).replace('[', '{').replace(']', '}')
-            # FIX EP-E-021: Express/Next route comments use ':param' for path
+            # Express/Next route comments use ':param' for path
             # params (e.g. "// DELETE /api/users/:id"). Normalize to the manifest's
             # '{param}' form so the URL matches; the method is already captured.
             raw_path   = re.sub(r':([A-Za-z_]\w*)', r'{\1}', raw_path)
@@ -163,10 +163,12 @@ class FrameworkPatternsMixin:
             # Emit as  /graphql#OperationName
             op_url   = f"{gql_endpoint}#{op_name}"
             gql_http = 'GRAPHQL'
-            gql_type_map = {'query': 'GRAPHQL_QUERY', 'mutation': 'GRAPHQL_MUTATION',
-                            'subscription': 'GRAPHQL_SUBSCRIPTION'}
+            # GQL_TAG_* (client code) is kept distinct from GRAPHQL_* (server
+            # introspection): the two are different kinds of evidence.
+            gql_type_map = {'query': 'GQL_TAG_QUERY', 'mutation': 'GQL_TAG_MUTATION',
+                            'subscription': 'GQL_TAG_SUBSCRIPTION'}
             self.add_endpoint(
-                op_url, gql_http, [], gql_type_map.get(op_type, 'GRAPHQL_QUERY'),
+                op_url, gql_http, [], gql_type_map.get(op_type, 'GQL_TAG_QUERY'),
                 source, 'GRAPHQL_API', 88
             )
 

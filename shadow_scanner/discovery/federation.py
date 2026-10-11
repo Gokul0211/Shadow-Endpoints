@@ -7,7 +7,8 @@ from collections import deque
 import requests
 from bs4 import BeautifulSoup, Comment
 
-from shadow_scanner.config import COMMON_ENDPOINTS, IGNORED_DOMAINS, LOW_VALUE_JS
+from shadow_scanner.config import COMMON_ENDPOINTS, LOW_VALUE_JS, is_ignored_url
+from shadow_scanner import config
 class EnhancedFederationHunter:
     def __init__(self, session, target_url):
         self.session = session
@@ -58,7 +59,8 @@ class EnhancedFederationHunter:
             print(f"  [!] {scan_errors} files failed to download")
 
         # ⭐ IMPROVEMENT 1: Forced endpoint probing for common API paths
-        self._probe_common_endpoints()
+        if config.PROBING_ENABLED:          # --no-probe disables the path wordlist
+            self._probe_common_endpoints()
 
         print(f"  [+] JS: {len(self.found_js_files)}, JSON: {len(self.found_json_files)}")
         return list(self.found_js_files), list(self.found_json_files)
@@ -174,7 +176,7 @@ class EnhancedFederationHunter:
 
             for s in scripts:
                 url = urllib.parse.urljoin(self.target_url, s['src'])
-                if not any(b in url for b in IGNORED_DOMAINS):
+                if not is_ignored_url(url):
                     if url not in self.found_js_files:
                         self.found_js_files.add(url)
                         self.scan_queue.append(url)
@@ -197,7 +199,7 @@ class EnhancedFederationHunter:
                 if not _js_ref or len(_js_ref) < 3:
                     continue
                 _url = urllib.parse.urljoin(self.target_url, _js_ref)
-                if not any(b in _url for b in IGNORED_DOMAINS):
+                if not is_ignored_url(_url):
                     if _url not in self.found_js_files:
                         self.found_js_files.add(_url)
                         self.scan_queue.append(_url)
@@ -211,7 +213,7 @@ class EnhancedFederationHunter:
             )
             for m in _event_js_re.finditer(r.text):
                 _url = urllib.parse.urljoin(self.target_url, m.group(1).strip())
-                if _url not in self.found_js_files and not any(b in _url for b in IGNORED_DOMAINS):
+                if _url not in self.found_js_files and not is_ignored_url(_url):
                     self.found_js_files.add(_url)
                     self.scan_queue.append(_url)
 
@@ -223,7 +225,7 @@ class EnhancedFederationHunter:
                 if any(x in rel for x in ['preload', 'prefetch', 'modulepreload']):
                     if as_type == 'script' or href.endswith('.js') or '.js?' in href:
                         _url = urllib.parse.urljoin(self.target_url, href)
-                        if _url not in self.found_js_files and not any(b in _url for b in IGNORED_DOMAINS):
+                        if _url not in self.found_js_files and not is_ignored_url(_url):
                             self.found_js_files.add(_url)
                             self.scan_queue.append(_url)
 
@@ -235,19 +237,19 @@ class EnhancedFederationHunter:
                 # Dynamic import() calls
                 for m in re.finditer(r'''import\s*\(\s*["']([^"']+\.(?:js|mjs)(?:\?[^"']*)?)["']\s*\)''', inline_code):
                     _url = urllib.parse.urljoin(self.target_url, m.group(1))
-                    if _url not in self.found_js_files and not any(b in _url for b in IGNORED_DOMAINS):
+                    if _url not in self.found_js_files and not is_ignored_url(_url):
                         self.found_js_files.add(_url)
                         self.scan_queue.append(_url)
                 # document.createElement('script'); ...src = '...'
                 for m in re.finditer(r'''\.src\s*=\s*["']([^"']+\.js(?:\?[^"']*)?)["']''', inline_code):
                     _url = urllib.parse.urljoin(self.target_url, m.group(1))
-                    if _url not in self.found_js_files and not any(b in _url for b in IGNORED_DOMAINS):
+                    if _url not in self.found_js_files and not is_ignored_url(_url):
                         self.found_js_files.add(_url)
                         self.scan_queue.append(_url)
                 # SystemJS.import / System.import
                 for m in re.finditer(r'''(?:SystemJS|System)\.import\s*\(\s*["']([^"']+\.js(?:\?[^"']*)?)["']''', inline_code):
                     _url = urllib.parse.urljoin(self.target_url, m.group(1))
-                    if _url not in self.found_js_files and not any(b in _url for b in IGNORED_DOMAINS):
+                    if _url not in self.found_js_files and not is_ignored_url(_url):
                         self.found_js_files.add(_url)
                         self.scan_queue.append(_url)
 
@@ -259,7 +261,7 @@ class EnhancedFederationHunter:
             )
             for m in _worker_re.finditer(r.text):
                 _url = urllib.parse.urljoin(self.target_url, m.group(1))
-                if _url not in self.found_js_files and not any(b in _url for b in IGNORED_DOMAINS):
+                if _url not in self.found_js_files and not is_ignored_url(_url):
                     self.found_js_files.add(_url)
                     self.scan_queue.append(_url)
 
@@ -268,7 +270,7 @@ class EnhancedFederationHunter:
                 ns_text = str(ns)
                 for m in re.finditer(r'''(?:src|href)\s*=\s*["']([^"']*?\.js(?:\?[^"']*)?)["']''', ns_text, re.IGNORECASE):
                     _url = urllib.parse.urljoin(self.target_url, m.group(1))
-                    if _url not in self.found_js_files and not any(b in _url for b in IGNORED_DOMAINS):
+                    if _url not in self.found_js_files and not is_ignored_url(_url):
                         self.found_js_files.add(_url)
                         self.scan_queue.append(_url)
 
@@ -276,7 +278,7 @@ class EnhancedFederationHunter:
             for comment in soup.find_all(string=lambda t: isinstance(t, Comment)):
                 for m in re.finditer(r'''(?:src|href)\s*=\s*["']([^"']*?\.js(?:\?[^"']*)?)["']''', str(comment), re.IGNORECASE):
                     _url = urllib.parse.urljoin(self.target_url, m.group(1))
-                    if _url not in self.found_js_files and not any(b in _url for b in IGNORED_DOMAINS):
+                    if _url not in self.found_js_files and not is_ignored_url(_url):
                         self.found_js_files.add(_url)
                         self.scan_queue.append(_url)
 

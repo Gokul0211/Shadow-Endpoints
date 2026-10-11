@@ -5,7 +5,7 @@ import time
 import urllib.parse
 from collections import deque
 
-from shadow_scanner.config import IGNORED_DOMAINS, PLAYWRIGHT_AVAILABLE, logger, sync_playwright
+from shadow_scanner.config import PLAYWRIGHT_AVAILABLE, is_ignored_url, logger, sync_playwright
 from shadow_scanner.dynamic.browser_scripts import INTERCEPTOR_SCRIPT
 from shadow_scanner.dynamic.indexeddb import IndexedDBExtractor
 from shadow_scanner.dynamic.webpack_runtime import WebpackModuleGraphReconstructor
@@ -38,6 +38,8 @@ class DynamicInterceptor:
         self.discovered_routes = set()
         self.max_routes = max_routes
         self.max_depth = max_depth
+        self._depth1_routes = []
+        self.skipped_clicks = []     # labels the denylist refused to click
         self.session_storage_data = {}
         self.local_storage_data = {}
         # Queue: decouple JS analysis from Playwright's event loop to prevent
@@ -75,22 +77,27 @@ class DynamicInterceptor:
             print(f"    Discovered {len(self.discovered_routes)} unique routes")
             print(f"    Captured {len(self.endpoints)} API calls")
 
-        # FIX PHASE3-REPASS: Navigate product/list routes a second time now that
-        # localStorage is populated from the first pass. This catches useEffect
-        # fetch calls that missed the token on the first navigation.
-        if self.auth_headers.get('Authorization') and PLAYWRIGHT_AVAILABLE:
-            _repass_routes = [
-                self.target_url + r for r in
-                ['/products', '/catalog', '/orders', '/dashboard', '/users', '']
-                if not (self.target_url + r).rstrip('/') in
-                   {r.rstrip('/') for r in self.discovered_routes}
-            ]
-            if _repass_routes:
-                print(f"\n  [REPASS] Re-navigating {len(_repass_routes)} route(s) with auth token in storage...")
-                self._navigate_routes_with_feedback(_repass_routes[:5], depth=99)
+        # Re-pass: revisit the first routes of depth 1 now that the token is in
+        # browser storage (effects that read the token on mount fire this time).
+        # Uses routes this scan actually visited - no fixed route names.
+        if self.auth_headers.get('Authorization') and PLAYWRIGHT_AVAILABLE and self._depth1_routes:
+            _repass_routes = self._depth1_routes[:5]
+            print(f"\n  [REPASS] Re-navigating {len(_repass_routes)} route(s) with auth token in storage...")
+            self._navigate_routes_with_feedback(_repass_routes, depth=99)
 
         print(f"\n  [+] Total dynamic endpoints: {len(self.endpoints)}")
         print(f"  [+] Total JS files analyzed: {len(self.analyzed_js_files)}")
+
+        # Every observed request becomes RUNTIME evidence in the shared store,
+        # so it is merged and scored with the static findings (one store).
+        for e in self.endpoints:
+            try:
+                self.analyzer.add_endpoint(
+                    e['endpoint'], e.get('method', 'GET'), e.get('parameters', []),
+                    e.get('type', 'DYNAMIC_XHR_INTERCEPT'), e.get('source', 'Browser'),
+                    e.get('classification', 'VERIFIED_API'), e.get('confidence_score', 95))
+            except Exception as exc:
+                logger.debug(f"[PHASE 3] could not record {e.get('endpoint')}: {exc}")
 
         return self.endpoints
 
@@ -109,22 +116,7 @@ class DynamicInterceptor:
                     if clean and clean not in routes:
                         routes.append(clean)
 
-            # FIX PHASE3-ROUTES: Always probe common SPA routes at depth 1.
-            # These trigger component-level API calls that only fire when a user
-            # navigates to the relevant page (not just the root).
-            _spa_common_routes = []
-            if len(static_endpoints) < 3:
-                _spa_common_routes = [
-                    '/dashboard', '/products', '/catalog', '/shop', '/orders',
-                    '/users', '/profile', '/settings', '/admin', '/reports',
-                    '/permits', '/login', '/home', '/app', '/main',
-                    '/api-explorer', '/billing', '/team', '/analytics',
-                ]
-            _base = self.base_url.rstrip('/')
-            for _r in _spa_common_routes:
-                _full = _base + _r
-                if _full not in routes:
-                    routes.append(_full)
+            # (No guessed route names: routes come from the code and the pages.)
         else:
             # Subsequent passes: use newly discovered routes
             routes = list(self.discovered_routes)
@@ -136,11 +128,15 @@ class DynamicInterceptor:
                     if clean and clean not in self.discovered_routes:
                         routes.append(clean)
 
-        # Prioritize routes with hash fragments and deeper paths
-        routes = self._prioritize_routes(routes, depth)
+        # Prioritize routes with hash fragments and deeper paths (sorted first so
+        # equal scores keep a stable order)
+        routes = self._prioritize_routes(sorted(set(routes)), depth)
 
         # Limit routes per depth
-        return routes[:self.max_routes]
+        routes = routes[:self.max_routes]
+        if depth == 1:
+            self._depth1_routes = list(routes)
+        return routes
 
     def _clean_route(self, endpoint):
         """Clean and normalize a route for navigation - WITH AGGRESSIVE FILTERING"""
@@ -559,7 +555,7 @@ class DynamicInterceptor:
             logger.debug(f"[Suppressed] {_exc}")
 
         # FIX FN-7: Read IndexedDB product-cache and similar API URL caches
-        # TC-P4-010: React/Vue apps cache fetch() URLs in IndexedDB.
+        # React/Vue apps cache fetch() URLs in IndexedDB.
         try:
             idb_urls = page.evaluate('''
                 () => new Promise((resolve) => {
@@ -631,7 +627,7 @@ class DynamicInterceptor:
         url = response.url
 
         # Skip ignored domains
-        if any(b in url for b in IGNORED_DOMAINS):
+        if is_ignored_url(url):
             return
 
         # Skip if already seen
@@ -676,8 +672,16 @@ class DynamicInterceptor:
                 try:
                     endpoint = url.split('?')[0]
 
-                    # Try to infer HTTP method from request
-                    method = "GET"  # Default assumption for responses
+                    # The method of the request this response answers (not assumed)
+                    try:
+                        method = (response.request.method or 'GET').upper()
+                    except Exception:
+                        method = "GET"
+                    # Already recorded from the request event -> nothing new
+                    if f"{method}:{endpoint}" in self.seen_requests:
+                        return
+                    if response.request.resource_type not in ('xhr', 'fetch'):
+                        return
 
                     # Extract parameters from query string
                     params = []
@@ -726,7 +730,7 @@ class DynamicInterceptor:
             self._ext_link_extractor.feed_request_url(url, source='Browser_Request')
 
         # Skip ignored domains
-        if any(b in url for b in IGNORED_DOMAINS):
+        if is_ignored_url(url):
             return
 
         # ── Live header intel (T1.1) ──────────────────────────────────────────
@@ -756,12 +760,17 @@ class DynamicInterceptor:
                 if parsed.query:
                     params.extend(urllib.parse.parse_qs(parsed.query).keys())
 
-                # Only record if from our domain
-                if self.domain in url:
+                # Every XHR/fetch the app sends is recorded, whatever its origin
+                # (APIs usually live on another host than the SPA); third-party
+                # hosts were already skipped above. Scope (target host, sibling
+                # subdomains, referenced hosts) is decided at evaluation time.
+                rkey = f"{method}:{endpoint}"
+                if rkey not in self.seen_requests:
+                    self.seen_requests.add(rkey)
                     self.endpoints.append({
                         "endpoint": endpoint,
                         "method": method,
-                        "parameters": list(set(params)),
+                        "parameters": sorted(set(params)),
                         "type": "DYNAMIC_XHR_INTERCEPT",
                         "source": "Browser_Request",
                         "classification": "VERIFIED_API",
@@ -771,6 +780,35 @@ class DynamicInterceptor:
                 logger.debug(f"[Suppressed] {_exc}")
 
     # ⭐ ENHANCEMENT 1.4: Active crawling - interact with page elements
+    # Elements whose text says they change or end something are never clicked:
+    # the crawl runs with the user's session (DS2: requests are not blocked, so
+    # the denylist is the safeguard). Matched against text, aria-label, title,
+    # value and href.
+    CLICK_DENYLIST = re.compile(
+        r'log\s*-?\s*out|sign\s*-?\s*out|delete|remove|destroy|purge|erase|\bdrop\b|'
+        r'\bpay\b|payment|purchase|\bbuy\b|checkout|place\s+order|submit\s+order|'
+        r'confirm|transfer|withdraw|unsubscribe|deactivate|disable|revoke|reset|'
+        r'cancel\s+(?:subscription|order|account)|close\s+account|terminate',
+        re.IGNORECASE)
+
+    def _click(self, elem, timeout):
+        """Click unless the element's label matches CLICK_DENYLIST."""
+        try:
+            label = ' '.join(filter(None, [
+                (elem.inner_text(timeout=500) or '')[:200],
+                elem.get_attribute('aria-label') or '',
+                elem.get_attribute('title') or '',
+                elem.get_attribute('value') or '',
+                elem.get_attribute('href') or '',
+            ]))
+        except Exception:
+            label = ''
+        if self.CLICK_DENYLIST.search(label):
+            self.skipped_clicks.append(label.strip()[:80])
+            return False
+        elem.click(timeout=timeout)
+        return True
+
     def _active_crawl_interactions(self, page):
         """
         Actively interact with page elements to trigger lazy-loaded API calls.
@@ -799,7 +837,7 @@ class DynamicInterceptor:
                     elements = page.query_selector_all(selector)
                     for elem in elements[:2]:  # Click up to 2 of each type
                         try:
-                            elem.click(timeout=1000)
+                            self._click(elem, 1000)
                             time.sleep(0.5)  # Wait for navigation/API calls
                         except Exception as _exc:
                             logger.debug(f"[Suppressed] {_exc}")
@@ -810,7 +848,7 @@ class DynamicInterceptor:
             buttons = page.query_selector_all("button:visible")
             for i, button in enumerate(buttons[:20]):  # INCREASED limit to discover more lazy APIs
                 try:
-                    button.click(timeout=1000)
+                    self._click(button, 1000)
                     time.sleep(0.3)  # Let API call complete
                 except Exception as _exc:
                     logger.debug(f"[Suppressed] {_exc}")
@@ -819,7 +857,7 @@ class DynamicInterceptor:
             action_buttons = page.query_selector_all("button[type='submit']:visible, input[type='submit']:visible, button.submit:visible, button.action:visible")
             for i, btn in enumerate(action_buttons[:10]):
                 try:
-                    btn.click(timeout=1000)
+                    self._click(btn, 1000)
                     time.sleep(0.4)
                 except Exception as _exc:
                     logger.debug(f"[Suppressed] {_exc}")
@@ -828,7 +866,7 @@ class DynamicInterceptor:
             clickables = page.query_selector_all("[ng-click]:visible, [onclick]:visible, .clickable:visible")
             for i, elem in enumerate(clickables[:5]):  # Limit to 5
                 try:
-                    elem.click(timeout=1000)
+                    self._click(elem, 1000)
                     time.sleep(0.3)
                 except Exception as _exc:
                     logger.debug(f"[Suppressed] {_exc}")
@@ -837,7 +875,7 @@ class DynamicInterceptor:
             tabs = page.query_selector_all("[role='tab']:visible, .tab:visible, .nav-link:visible")
             for i, tab in enumerate(tabs[:8]):
                 try:
-                    tab.click(timeout=1000)
+                    self._click(tab, 1000)
                     time.sleep(0.4)  # Give time for lazy-loaded APIs
                 except Exception as _exc:
                     logger.debug(f"[Suppressed] {_exc}")
@@ -846,7 +884,7 @@ class DynamicInterceptor:
             selects = page.query_selector_all("select:visible")
             for select in selects[:5]:
                 try:
-                    select.click(timeout=500)
+                    self._click(select, 500)
                     time.sleep(0.2)
                 except Exception as _exc:
                     logger.debug(f"[Suppressed] {_exc}")
@@ -884,9 +922,11 @@ class DynamicInterceptor:
                             else:
                                 target_url = f"{self.base_url}/{href}"
 
-                            # Record for next depth pass instead of navigating away
-                            if target_url not in self.seen_requests and self.domain in target_url:
-                                self.seen_requests.add(target_url)
+                            # Queue for the next depth pass (was added to seen_requests,
+                            # which nothing reads for navigation, so it was never visited)
+                            clean = self._clean_route(target_url)
+                            if clean:
+                                self.discovered_routes.add(clean)
                     except Exception as _exc:
                         logger.debug(f"[Suppressed] {_exc}")
             except Exception as _exc:

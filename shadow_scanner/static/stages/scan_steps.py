@@ -19,77 +19,61 @@ class ScanStepsMixin:
         # STEP 1: Parallel fetch + variable extraction
         # I/O-bound: ThreadPoolExecutor gives 5-10x speedup over sequential
         # ==================================================================
-        print("\n  [Step 1/4] Fetching & extracting variables (multi-threaded)...")
-        js_contents = {}
-        fetch_lock   = threading.Lock()   # guards js_contents writes
-        resolve_lock = threading.Lock()   # guards self.resolver shared state
-        completed    = [0]                # mutable counter for progress
+        print("\n  [Step 1/4] Fetching (parallel) & extracting variables (in URL order)...")
+        fetched      = {}
+        fetch_lock   = threading.Lock()   # guards fetched writes
 
-        # Filter low-value files up-front (same logic as before)
-        urls_to_fetch = [
+        # Filter low-value files up-front; sorted so every later step sees the
+        # files in the same order on every run (determinism, S14).
+        urls_to_fetch = sorted({
             url for url in js_urls
             if not any(x in url.lower() for x in LOW_VALUE_JS)
-        ]
+        })
 
-        def _fetch_and_extract(url):
-            """Fetch one JS file and extract variables. Thread-safe."""
+        def _fetch(url):
+            """Fetch one JS file (cache first). Thread-safe; no analysis here."""
             try:
-                # ── Cache hit: skip network request ──────────────────────
                 if self.scan_cache and self.scan_cache.has(url):
                     code = self.scan_cache.get(url)
                     if code:
                         logger.debug(f"[Cache] HIT {url}")
-                        filename = url.split('/')[-1]
-                        with resolve_lock:
-                            self.resolver.extract_all_variables(code, filename)
-                            self.analyzed_js_files.add(url)
                         with fetch_lock:
-                            js_contents[url] = code
-                            completed[0] += 1
+                            fetched[url] = code
                         return
-
-                # ── Cache miss: rate-limited fetch ───────────────────────
                 r = self.rate_limiter.throttled_get(
                     self.session, url, timeout=self.fetch_timeout, verify=False
                 )
                 if r.status_code != 200:
                     logger.debug(f"[Fetch] HTTP {r.status_code} for {url}")
                     return
-                filename = url.split('/')[-1]
-                code     = r.text
-
-                # Store in cache for resume
+                code = r.text
                 if self.scan_cache:
                     self.scan_cache.put(url, code)
-
-                # --- variable extraction (regex-heavy, release GIL enough) ---
-                with resolve_lock:
-                    self.resolver.extract_all_variables(code, filename)
-                    self.analyzed_js_files.add(url)
-
                 with fetch_lock:
-                    js_contents[url] = code
-                    completed[0] += 1
-                    done = completed[0]
-
-                if done % 10 == 0:
-                    print(f"    Progress: [{done}/{len(urls_to_fetch)}]", end='\r')
-
+                    fetched[url] = code
             except requests.exceptions.Timeout:
                 logger.debug(f"[Fetch] Timeout: {url}")
             except Exception as exc:
                 logger.debug(f"[Fetch] Error fetching {url}: {exc}")
 
-        # Tune max_workers: 15 is a sweet spot for typical scan targets.
-        # Too high → target rate-limits / WAF triggers. Too low → no speedup.
         with ThreadPoolExecutor(max_workers=self.MAX_FETCH_WORKERS) as executor:
-            futures = {executor.submit(_fetch_and_extract, url): url for url in urls_to_fetch}
-            for future in as_completed(futures):
-                # Propagate any unexpected exceptions to the surface
+            for future in as_completed([executor.submit(_fetch, url) for url in urls_to_fetch]):
                 try:
                     future.result()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug(f"[Fetch] {exc}")
+
+        # Variable extraction in URL order: the resolver is order-sensitive
+        # (later registrations can overwrite earlier ones), so thread completion
+        # order must not decide it.
+        js_contents = {}
+        for url in urls_to_fetch:
+            if url not in fetched:
+                continue
+            code = fetched[url]
+            self.resolver.extract_all_variables(code, url.split('/')[-1])
+            self.analyzed_js_files.add(url)
+            js_contents[url] = code
 
         print(f"\n    [+] Fetched {len(js_contents)}/{len(urls_to_fetch)} JS files")
         print(f"    [+] Extracted {len(self.resolver.variables)} unique variables")
@@ -192,7 +176,7 @@ class ScanStepsMixin:
         print("\n  [Step 2/4] Extracting RPC patterns with method calls...")
         rpc_count = 0
 
-        for url, code in js_contents.items():
+        for url, code in sorted(js_contents.items()):
             filename = url.split('/')[-1]
             rpc_endpoints = self.rpc_extractor.extract_rpc_patterns(code, filename)
 
@@ -210,60 +194,60 @@ class ScanStepsMixin:
                 )
                 rpc_count += 1
 
-            # Check for Array Harvested Items
-            for var_name, var_data in self.resolver.variables.items():
-                if var_name.startswith("ARRAY_ITEM_"):
-                    raw_val = var_data['value']
-                    # ── FP FILTER: Reject React component/route names ──
-                    # These are single PascalCase words (no slash, no dot) that
-                    # appear in JSX import arrays but aren't API endpoints.
-                    # e.g. "CategoryCreation", "CompletedTaskList", "Tiker"
-                    # KEEP items with slashes (real paths) or api_ prefix.
-                    stripped = raw_val.strip('/')
-                    if '/' not in stripped and '.' not in stripped and not stripped.startswith('api_'):
-                        # Single-word: only keep if it looks like a backend CRUD operation.
-                        # FP6 FIX: Also require minimum length (≥6 chars) and disallow
-                        # common UI/marketing words that share CRUD prefixes:
-                        # "GetStarted", "FindMe", "AddToCart", "SendEmail", "SubmitFeedback"
-                        # These are React prop names / event handlers, not API method names.
-                        _CRUD_RE = re.compile(
-                            r'^(Get|Create|Update|Delete|Insert|Fetch|Save|Find|Search|'
-                            r'Upload|Download|Send|Submit|Add|Remove|Change|Mark|Verify|'
-                            r'Endorse|Close|Extend|Bulk|Report)',
-                            re.I
-                        )
-                        _UI_WORDS = {
-                            'getstarted', 'gethelp', 'getmore', 'findme', 'findout',
-                            'addtocart', 'additem', 'sendemail', 'sendmessage',
-                            'submitfeedback', 'submitform', 'uploadfile', 'downloadapp',
-                            'createaccount', 'createprofile', 'updateprofile',
-                            'removeitem', 'deletefile', 'searchresults', 'searchbar',
-                        }
-                        lower_stripped = stripped.lower()
-                        if not _CRUD_RE.match(stripped):
-                            continue
-                        if len(stripped) < 6:
-                            continue
-                        if lower_stripped in _UI_WORDS:
-                            continue
-                        # Must contain at least one uppercase letter after the first
-                        # (real RPC methods are camelCase/PascalCase with noun subjects)
-                        if not re.search(r'[A-Z]', stripped[1:]):
-                            continue
-                    full_url = self.normalizer.normalize(raw_val)
-                    # Infer method from the last path segment name instead of hardcoding GET.
-                    # e.g. DeleteTask → DELETE, CreateToken → POST, UpdateQuestion → PUT
-                    ep_name = full_url.rstrip('/').split('/')[-1]
-                    inferred_method = self._guess_method_from_key(ep_name)
-                    self.add_endpoint(
-                        full_url,
-                        inferred_method,
-                        [],
-                        "ARRAY_HARVEST",
-                        var_data['source_file'],
-                        "BACKEND_API",
-                        60
+        # Array-harvested items are global (one pass, not once per file)
+        for var_name, var_data in sorted(self.resolver.variables.items()):
+            if var_name.startswith("ARRAY_ITEM_"):
+                raw_val = var_data['value']
+                # ── FP FILTER: Reject React component/route names ──
+                # These are single PascalCase words (no slash, no dot) that
+                # appear in JSX import arrays but aren't API endpoints.
+                # e.g. "CategoryCreation", "CompletedTaskList", "Tiker"
+                # KEEP items with slashes (real paths).
+                stripped = raw_val.strip('/')
+                if '/' not in stripped and '.' not in stripped:
+                    # Single-word: only keep if it looks like a backend CRUD operation.
+                    # FP6 FIX: Also require minimum length (≥6 chars) and disallow
+                    # common UI/marketing words that share CRUD prefixes:
+                    # "GetStarted", "FindMe", "AddToCart", "SendEmail", "SubmitFeedback"
+                    # These are React prop names / event handlers, not API method names.
+                    _CRUD_RE = re.compile(
+                        r'^(Get|Create|Update|Delete|Insert|Fetch|Save|Find|Search|'
+                        r'Upload|Download|Send|Submit|Add|Remove|Change|Mark|Verify|'
+                        r'Close|Report)',
+                        re.I
                     )
+                    _UI_WORDS = {
+                        'getstarted', 'gethelp', 'getmore', 'findme', 'findout',
+                        'addtocart', 'additem', 'sendemail', 'sendmessage',
+                        'submitfeedback', 'submitform', 'uploadfile', 'downloadapp',
+                        'createaccount', 'createprofile', 'updateprofile',
+                        'removeitem', 'deletefile', 'searchresults', 'searchbar',
+                    }
+                    lower_stripped = stripped.lower()
+                    if not _CRUD_RE.match(stripped):
+                        continue
+                    if len(stripped) < 6:
+                        continue
+                    if lower_stripped in _UI_WORDS:
+                        continue
+                    # Must contain at least one uppercase letter after the first
+                    # (real RPC methods are camelCase/PascalCase with noun subjects)
+                    if not re.search(r'[A-Z]', stripped[1:]):
+                        continue
+                full_url = self.normalizer.normalize(raw_val)
+                # Infer method from the last path segment name instead of hardcoding GET.
+                # e.g. DeleteTask → DELETE, CreateToken → POST, UpdateQuestion → PUT
+                ep_name = full_url.rstrip('/').split('/')[-1]
+                inferred_method = self._guess_method_from_key(ep_name)
+                self.add_endpoint(
+                    full_url,
+                    inferred_method,
+                    [],
+                    "ARRAY_HARVEST",
+                    var_data['source_file'],
+                    "BACKEND_API",
+                    60
+                )
 
         print(f"    [+] Found {rpc_count} RPC-style endpoints")
 
@@ -273,7 +257,7 @@ class ScanStepsMixin:
         print("\n  [Step 3/4] Extracting service property endpoints...")
         service_count = 0
 
-        for prop_name, prop_data in self.resolver.service_properties.items():
+        for prop_name, prop_data in sorted(self.resolver.service_properties.items()):
             full_url = self.normalizer.normalize(prop_data['endpoint'])
             method = self._guess_method_from_key(prop_name)
 
@@ -295,43 +279,22 @@ class ScanStepsMixin:
         # ==================================================================
         # STEP 4: Parallel JSON config analysis + parallel analyze_code
         # ==================================================================
-        print("\n  [Step 4/4] Standard endpoint analysis (multi-threaded)...")
+        print("\n  [Step 4/4] Standard endpoint analysis (in URL order)...")
 
-        add_lock = threading.Lock()   # guards self.add_endpoint / self.endpoints
-
-        # --- 4a: JSON configs (I/O bound) ---
-        def _analyze_json(json_url):
+        # Sequential and sorted: the analysis is CPU-bound (threads gave no
+        # speed-up under the GIL) and insertion order used to decide ties, so
+        # the old thread pool made results vary between runs (S14).
+        for json_url in sorted(set(json_urls)):
             try:
                 self.analyze_json_config(json_url)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning(f"[analyze] JSON config {json_url}: {exc}")
 
-        with ThreadPoolExecutor(max_workers=10) as executor:
-            list(executor.map(_analyze_json, json_urls))
-
-        # --- 4b: JS code analysis (CPU + regex bound) ---
-        # analyze_code calls add_endpoint which mutates self.endpoints.
-        # We patch add_endpoint to be thread-safe for this phase only.
-        _original_add = self.add_endpoint
-
-        def _safe_add(url, method, params, type_, source, classification, confidence, extra_fields=None):
-            with add_lock:
-                _original_add(url, method, params, type_, source, classification, confidence, extra_fields)
-
-        self.add_endpoint = _safe_add  # monkeypatch for duration of parallel phase
-
-        def _analyze_code_task(item):
-            url, code = item
+        for url, code in sorted(js_contents.items()):
             try:
                 self.analyze_code(code, url)
-            except Exception:
-                pass
-
-        MAX_CODE_WORKERS = self.MAX_CODE_WORKERS   # regex is CPU-heavy; more workers risks GIL contention
-        with ThreadPoolExecutor(max_workers=MAX_CODE_WORKERS) as executor:
-            list(executor.map(_analyze_code_task, js_contents.items()))
-
-        self.add_endpoint = _original_add  # restore original
+            except Exception as exc:
+                logger.warning(f"[analyze] {url}: {type(exc).__name__}: {exc}")
 
     def _analyze_webpack_module_bodies(self, js_contents):
         """Run every webpack module body through analyze_code individually."""
@@ -343,7 +306,7 @@ class ScanStepsMixin:
         _wpk_static = StaticWebpackModuleAnalyzer(self)
         _wpk_snap   = len(self.endpoints)
         _wpk_bundles = 0
-        for _url, _code in js_contents.items():
+        for _url, _code in sorted(js_contents.items()):
             try:
                 new_from_wpk = _wpk_static.analyze_bundle(_code, _url)
                 if new_from_wpk > 0:
@@ -360,7 +323,7 @@ class ScanStepsMixin:
         ws_discovery = WebSocketDiscovery()
         ws_count = 0
 
-        for url, code in js_contents.items():
+        for url, code in sorted(js_contents.items()):
             ws_endpoints = ws_discovery.discover_from_js(code, url)
             for ws_ep in ws_endpoints:
                 self.add_endpoint(
@@ -373,15 +336,10 @@ class ScanStepsMixin:
                     85
                 )
                 ws_count += 1
-                # Force correct classification/method if the URL was deduplicated
-                # with a lower-confidence entry that had wrong classification.
-                _ws_url_norm = ws_ep['endpoint'].rstrip('/')
-                for _ep in self.endpoints:
-                    if _ep['endpoint'].rstrip('/') == _ws_url_norm:
-                        _ep['classification'] = 'WEBSOCKET_ENDPOINT'
-                        _ep['method'] = 'WS'
-                        _ep['confidence_score'] = max(_ep.get('confidence_score', 0), 85)
-                        break
+                # A ws:// URL is a WebSocket whatever extractor saw it first
+                _ep = self._index.get(ws_ep['endpoint'].rstrip('/'))
+                if _ep is not None:
+                    _ep['classification'] = 'WEBSOCKET_ENDPOINT'
 
         if ws_count > 0:
             print(f"    [+] Found {ws_count} WebSocket endpoints")
@@ -396,13 +354,14 @@ class ScanStepsMixin:
         _dyn_rounds = 0
         while self._dynamic_imports and _dyn_rounds < 2:
             _dyn_rounds += 1
-            _new_imports = self._dynamic_imports - set(js_contents.keys()) - self.analyzed_js_files
+            _new_imports = {u for u in self._dynamic_imports
+                            if u.startswith(('http://', 'https://'))} - set(js_contents.keys()) - self.analyzed_js_files
             if not _new_imports:
                 break
             print(f"\n  [GAP2-DynamicImports] Round {_dyn_rounds}: fetching {len(_new_imports)} lazy chunk(s)...")
             self._dynamic_imports.clear()   # will be re-populated by analyze_code below
             _dyn_snap = len(self.endpoints)
-            for _dyn_url in _new_imports:
+            for _dyn_url in sorted(_new_imports):
                 try:
                     _r = self.rate_limiter.throttled_get(self.session, _dyn_url, timeout=20, verify=False)
                     if _r.status_code != 200:
@@ -429,8 +388,10 @@ class ScanStepsMixin:
     def _drop_low_confidence_endpoints(self):
         """Final strict confidence filter over self.endpoints."""
         # 🔥 FINAL FIX 2: Strict confidence filtering - remove all low-quality endpoints
+        self.finalize_scores()          # scores from ALL evidence before filtering
         pre_filter_count = len(self.endpoints)
-        self.endpoints = [
+        # Filtered IN PLACE: other phases hold references to this list (S26)
+        self.endpoints[:] = [
             ep for ep in self.endpoints
             if not (
                 # Remove zero-confidence vendor garbage
@@ -446,6 +407,7 @@ class ScanStepsMixin:
                 (ep.get("classification") == "EXTERNAL_REFERENCE" and ep.get("confidence_score", 0) < 50)
             )
         ]
+        self._rebuild_index()
         filtered_count = pre_filter_count - len(self.endpoints)
         if filtered_count > 0:
             print(f"    [FILTER] Removed {filtered_count} low-confidence/vendor endpoints")
@@ -460,21 +422,14 @@ class ScanStepsMixin:
         # Add all discovered GraphQL operations as endpoints
         graphql_ops_count = 0
 
-        # FIX EP-E GraphQL proxy remapping (TC-P4-001 GET HEURISTIC):
-        # When GraphQL is found at a backend host (localhost:4002) but the SPA is
-        # a different host (localhost:3005), detect if the SPA proxies GraphQL at
-        # its own /graphql path using TC-P4-001: a GET probe that returns a JSON
-        # indicator response (e.g. { introspection: 'enabled', playground: ... }).
-        #
-        # WHY GET not POST/static:
-        # - Static JS: App E main.js has NO '/graphql' literal in the client bundle.
-        # - POST introspection: App E proxies to Docker container hostname
-        #   'graphql-backend:4002' which is unreachable from the host machine.
-        # - GET probe: The handler immediately returns JSON with 'introspection'
-        #   key WITHOUT proxying. This is TC-P4-001 — a deliberate signal.
-        #
-        # FP protection: Apps A/B/C/D return HTML (SPA catch-all) for GET /graphql
-        # because they have no /graphql route. Content-Type check kills them.
+        # GraphQL proxy remapping: when GraphQL is found on a backend host but the
+        # SPA is served from another host, check whether the SPA also answers the
+        # same path itself (a same-origin proxy). Only confirmed paths are added:
+        #   1. a source map literally names the SPA-local URL;
+        #   2. GET returns JSON with GraphQL indicator keys (playground handlers);
+        #   3. POST { __typename } returns a JSON GraphQL response.
+        # SPAs without the route return their HTML shell; the Content-Type check
+        # rejects those.
         spa_parsed = urllib.parse.urlparse(self.base_url)
         spa_gql_bases = set()
 
@@ -495,15 +450,14 @@ class ScanStepsMixin:
 
             _spa_hosts_gql = False
 
-            # SIGNAL 1 (TC-P1.5-007): sourcemap_gql_endpoints — populated when
-            # _discover_nextjs_chunks() found api-graphql.js and its source map
-            # contained the literal SPA-local URL "http://localhost:3005/graphql".
+            # SIGNAL 1: sourcemap_gql_endpoints — populated when a harvested
+            # source map contains the literal SPA-local GraphQL URL.
             # This is the definitive static signal — requires no runtime probing.
             _sm_gql_eps = getattr(self, 'sourcemap_gql_endpoints', set())
             if remapped in _sm_gql_eps:
                 _spa_hosts_gql = True
 
-            # SIGNAL 2 (TC-P4-001): GET probe for JSON GraphQL playground indicator.
+            # SIGNAL 2: GET probe for JSON GraphQL playground indicator.
             # Next.js /api/graphql route returns { introspection: 'enabled', ... }
             # on GET. Works when the app is served by Next.js runtime (not nginx).
             if not _spa_hosts_gql:
@@ -615,7 +569,7 @@ class ScanStepsMixin:
                 )
                 graphql_ops_count += 1
 
-        # FIX EP-E: emit proxy-remapped ops onto SPA base_url for each backend schema
+        # Emit the operations again under each confirmed SPA-proxied GraphQL URL
         for backend_ep, spa_ep in spa_gql_bases:
             schema = graphql_schemas[backend_ep]
             # Emit the SPA-proxied base endpoint

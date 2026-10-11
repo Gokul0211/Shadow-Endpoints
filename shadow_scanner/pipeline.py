@@ -18,10 +18,11 @@ The scan pipeline - every phase in execution order.
 (The phase numbers are historical - they are the labels used in the paper and
 in the console output, which is why 1.55 etc. run after Phase 2.)
 
-Note on aliasing: analyzer.scan() returns analyzer.endpoints itself, so
-`static_endpoints` and `analyzer.endpoints` start out as the SAME list and
-later diverge when scan() is re-run.  This mirrors the original code exactly;
-save_report() de-duplicates the resulting overlap.
+One endpoint store: analyzer.endpoints (filtered in place, indexed by URL).
+Every phase adds evidence to it through analyzer.add_endpoint(); Phase 3 adds
+its observed requests to it too. `static_endpoints` below is the same list
+object, kept only as a name for readability - nothing copies or extends it.
+Each phase sets analyzer.current_phase, which is stored on every evidence item.
 """
 import os
 import re
@@ -100,12 +101,13 @@ def prepare_output_dirs(target):
 
 def phase1_5_sourcemaps(session, target, js_files, analyzer, sourcemap_dir):
     """Phase 1.5: Next.js hidden chunks + source-map harvest fed into the analyzer."""
-    # PHASE 1.5a: Next.js hidden chunk enumeration (TC-P1.5-007)
+    # PHASE 1.5a: Next.js chunk discovery (build manifest + runtime chunk map)
     # Discovers API route and resolver bundles not linked from HTML.
     # These contain source maps with SPA-local GraphQL URLs and resolver names.
+    analyzer.current_phase = '1.5'
     _nextjs_extra = _discover_nextjs_chunks(session, target, js_files)
     if _nextjs_extra:
-        js_files = list(set(js_files) | set(_nextjs_extra))
+        js_files = sorted(set(js_files) | set(_nextjs_extra))
         print(f"  [NEXT.JS CHUNKS] +{len(_nextjs_extra)} hidden chunk(s) added to harvest")
 
     # Run source map harvest (non-intrusive)
@@ -118,6 +120,7 @@ def phase2_static_analysis(analyzer, js_files, json_files):
     """Phase 2: EnhancedStaticAnalyzer.scan() over every discovered bundle."""
     # Phase 2: Static Analysis
     # analyzer already created above, just run scan
+    analyzer.current_phase = '2'
     static_endpoints = analyzer.scan(js_files, json_files)
 
     if len(static_endpoints) == 0 and len(js_files) > 0:
@@ -133,11 +136,12 @@ def phase1_55_subapp_index_pages(session, target, analyzer, js_files, static_end
     # ui_isolation) and probe those paths as HTML index pages to extract
     # their own JS bundles.  These sub-apps are independent Angular/React
     # applications deployed at separate base paths on the same origin.
+    analyzer.current_phase = '1.55'
     _subapp_js = _discover_subapp_index_pages(
         session, target, analyzer, set(js_files)
     )
     if _subapp_js:
-        js_files = list(set(js_files) | set(_subapp_js))
+        js_files = sorted(set(js_files) | set(_subapp_js))
         # Analyze the raw JS content of discovered sub-app bundles
         print(f"[PHASE 1.55] Analyzing {len(_subapp_js)} sub-app bundle(s)...")
         _snap155 = len(analyzer.endpoints)
@@ -145,13 +149,12 @@ def phase1_55_subapp_index_pages(session, target, analyzer, js_files, static_end
         _new_155 = len(analyzer.endpoints) - _snap155
         if _new_155:
             print(f"[PHASE 1.55] +{_new_155} endpoint(s) from sub-app JS bundles")
-            static_endpoints.extend(analyzer.endpoints[_snap155:])
         # Harvest source maps from sub-app bundles
         _, maps_155 = run_sourcemap_harvest(
             session, target, _subapp_js, analyzer, output_dir=sourcemap_dir
         )
         if maps_155:
-            found_maps = list(set(found_maps or []) | set(maps_155))
+            found_maps = sorted(set(found_maps or []) | set(maps_155))
 
         # ── RECURSIVE PASS: sub-app bundles may reference MORE sub-apps ──
         # e.g. ui_rc_permit/main.js (9.4MB) references ui_isolation,
@@ -160,19 +163,18 @@ def phase1_55_subapp_index_pages(session, target, analyzer, js_files, static_end
             session, target, analyzer, set(js_files)
         )
         if _subapp_js_r2:
-            js_files = list(set(js_files) | set(_subapp_js_r2))
+            js_files = sorted(set(js_files) | set(_subapp_js_r2))
             print(f"[PHASE 1.55] Recursive pass: {len(_subapp_js_r2)} more bundle(s)...")
             _snap155r = len(analyzer.endpoints)
             analyzer.scan(_subapp_js_r2, [])
             _new_r2 = len(analyzer.endpoints) - _snap155r
             if _new_r2:
                 print(f"[PHASE 1.55] +{_new_r2} endpoint(s) from recursive sub-app discovery")
-                static_endpoints.extend(analyzer.endpoints[_snap155r:])
             _, maps_r2 = run_sourcemap_harvest(
                 session, target, _subapp_js_r2, analyzer, output_dir=sourcemap_dir
             )
             if maps_r2:
-                found_maps = list(set(found_maps or []) | set(maps_r2))
+                found_maps = sorted(set(found_maps or []) | set(maps_r2))
     return js_files, found_maps
 
 
@@ -183,12 +185,13 @@ def phase1_6_bundle_discovery(session, target, analyzer, js_files, static_endpoi
     #   deterministically, replacing fragile route-heuristic navigation.
     # Step B: Legacy _discover_subapp_bundles_postanalysis as fallback for
     #   micro-frontends that use custom loading (not webpack chunk maps).
+    analyzer.current_phase = '1.6'
     _chunk_harvester = WebpackChunkHarvester(session, target)
     _wp_chunks = _chunk_harvester.harvest(js_files, known_urls=set(js_files))
     if _wp_chunks:
-        js_files = list(set(js_files) | set(_wp_chunks))
+        js_files = sorted(set(js_files) | set(_wp_chunks))
         print(f"[PHASE 1.6a] Webpack chunk harvester: +{len(_wp_chunks)} bundle(s)")
-    _new_subapp_js = list(set(
+    _new_subapp_js = sorted(set(
         _wp_chunks
         + _discover_subapp_bundles_postanalysis(
             session, target, static_endpoints, set(js_files)
@@ -196,28 +199,25 @@ def phase1_6_bundle_discovery(session, target, analyzer, js_files, static_endpoi
     ))
     if _new_subapp_js:
         print(f"\n[PHASE 1.6] Sub-app discovery: {len(_new_subapp_js)} new bundle(s) found")
-        js_files = list(set(js_files) | set(_new_subapp_js))
+        js_files = sorted(set(js_files) | set(_new_subapp_js))
 
         # 1.6a: Analyze raw JS bundles (catches hardcoded string literals
         #        in scripts bundles even when sourcesContent is null/empty)
         print("[PHASE 1.6] Analyzing raw JS content of sub-app bundles...")
-        _new_raw_eps = analyzer.scan(_new_subapp_js, [])
-        _new_from_16a = [e for e in _new_raw_eps if e not in static_endpoints]
-        if _new_from_16a:
-            static_endpoints.extend(_new_from_16a)
-            print(f"[PHASE 1.6] +{len(_new_from_16a)} endpoint(s) from sub-app raw JS")
+        _snap16a = len(analyzer.endpoints)
+        analyzer.scan(_new_subapp_js, [])
+        if len(analyzer.endpoints) > _snap16a:
+            print(f"[PHASE 1.6] +{len(analyzer.endpoints) - _snap16a} endpoint(s) from sub-app raw JS")
 
         # 1.6b: Harvest source maps (catches TypeScript service patterns
         #        in sourcesContent when the map has embedded source code)
         print("[PHASE 1.6] Harvesting source maps for sub-app bundles...")
         _snap16b = len(analyzer.endpoints)
         _, extra_maps16 = run_sourcemap_harvest(session, target, _new_subapp_js, analyzer, output_dir=sourcemap_dir)
-        _new_from_16b = analyzer.endpoints[_snap16b:]
-        if _new_from_16b:
-            static_endpoints.extend(_new_from_16b)
-            print(f"[PHASE 1.6] +{len(_new_from_16b)} endpoint(s) from sub-app source maps")
+        if len(analyzer.endpoints) > _snap16b:
+            print(f"[PHASE 1.6] +{len(analyzer.endpoints) - _snap16b} endpoint(s) from sub-app source maps")
         if extra_maps16:
-            found_maps = list(set(found_maps or []) | set(extra_maps16))
+            found_maps = sorted(set(found_maps or []) | set(extra_maps16))
     return js_files, found_maps
 
 
@@ -227,6 +227,7 @@ def phase1_75_service_workers(session, target, hunter, analyzer):
     # Runs after static analysis so analyze_code_from_dynamic() has full
     # variable resolver context, but before dynamic phase so SW-discovered
     # endpoints feed into Phase 3 route prioritisation.
+    analyzer.current_phase = '1.75'
     sw_analyzer = ServiceWorkerAnalyzer(session, target)
     sw_urls = sw_analyzer.discover_and_analyze(
         html        = hunter.raw_html,
@@ -242,6 +243,7 @@ def phase1_8_backend_intel(session, target, backend_dir, analyzer):
     # ── PHASE 1.8: BACKEND FILE HUNTER ───────────────────────────────────
     # Probe for exposed config, secret, source, and API spec files.
     # Completely passive — no fuzzing, only checks well-known paths.
+    analyzer.current_phase = '1.8'
     backend_hunter = BackendFileHunter(session, target, output_dir=backend_dir, analyzer=analyzer)
     backend_findings = backend_hunter.hunt()
     return backend_findings
@@ -252,17 +254,17 @@ def phase1_85_external_js(session, target, analyzer, js_files, ext_links, static
     # ── PHASE 1.85: EXTERNAL JS CRAWL (RC4-FIX) ─────────────────────────
     # remoteEntry.js files from Module Federation appear in external_links
     # as PARTNER_API tier but are never fetched or analyzed. Fetch .js files
-    # on localhost/127.0.0.1 and feed them into the analysis pipeline.
+    # on the target's host or its sibling subdomains and analyse them.
 
-    # FIX EP-B-004 (mfe-admin co-hosted): Extract ALL federation remotes from the
-    # shell bundle, including same-netloc path-based remotes like
-    # "mfeAdmin@http://localhost:3002/mfe-admin/remoteEntry.js" which never appear
-    # in external_links because they share the scan target's host:port.
+    # Extract ALL federation remotes from the shell bundle, including same-origin
+    # path-based remotes like "admin@https://app.example.com/admin/remoteEntry.js"
+    # which never appear in external_links because they share the target's origin.
     # Pattern: "name@http://host:port/path/remoteEntry.js" inside
     # __webpack_require__.federation.runtime.remotes = {...}
+    analyzer.current_phase = '1.85'
     _fed_remote_urls = set()
     _fed_re = re.compile(r'["\']?\w+["\']?\s*:\s*["\'][\w]+@(https?://[^"\']+remoteEntry\.js)["\']')
-    for _jf in js_files:
+    for _jf in sorted(set(js_files)):
         try:
             _jf_content = ''
             _r = session.get(_jf, timeout=10, verify=False)
@@ -276,18 +278,23 @@ def phase1_85_external_js(session, target, analyzer, js_files, ext_links, static
     _ext_js_urls = []
     _seen_ext = set(js_files)
     # Add federation remote URLs (including same-netloc co-hosted ones)
-    for _fu in _fed_remote_urls:
+    for _fu in sorted(_fed_remote_urls):
         if _fu not in _seen_ext:
             _ext_js_urls.append(_fu)
             _seen_ext.add(_fu)
-    # Add other localhost JS from external_links
+    # Add other first-party JS from external_links: same host (any port) or a
+    # subdomain of the target's parent domain (cdn.example.com for app.example.com)
+    _t_host = (urllib.parse.urlparse(target).hostname or '').lower()
+    _t_labels = _t_host.split('.')
+    _t_parent = ('.'.join(_t_labels[-2:]) if len(_t_labels) >= 2
+                 and not re.fullmatch(r'[\d.]+', _t_host) else _t_host)
     for _el in ext_links.get_results():
         _eu = _el.get('url', '')
         if not _eu.endswith('.js'):
             continue
         try:
-            _ep = urllib.parse.urlparse(_eu)
-            if _ep.hostname in ('localhost', '127.0.0.1') or _ep.netloc == urllib.parse.urlparse(target).netloc:
+            _eh = (urllib.parse.urlparse(_eu).hostname or '').lower()
+            if _eh == _t_host or _eh == _t_parent or _eh.endswith('.' + _t_parent):
                 if _eu not in _seen_ext:
                     _ext_js_urls.append(_eu)
                     _seen_ext.add(_eu)
@@ -297,7 +304,7 @@ def phase1_85_external_js(session, target, analyzer, js_files, ext_links, static
     if _ext_js_urls:
         print(f"\n[PHASE 1.85] External JS crawl: {len(_ext_js_urls)} remote JS file(s) from external_links")
         _snap_ext = len(analyzer.endpoints)
-        # FIX EP-B-004/EP-B-016 (mfe-admin main.js never analyzed via source map):
+        # Remote main.js bundles are never analysed via their source map by
         # the recursive main.js fetch below runs raw analyze_code() on the minified
         # text, but never fetches main.js.map — so the same TS-aware / object-literal
         # / string-concatenation extraction that finds config values and array-assembled
@@ -318,22 +325,21 @@ def phase1_85_external_js(session, target, analyzer, js_files, ext_links, static
                     continue
                 analyzer.analyze_code_from_dynamic(code, _ext_url)
                 js_files.append(_ext_url)
-                # Emit the remoteEntry.js URL itself as an endpoint.
-                # EP-B-001/002 are the remoteEntry.js URLs — the manifest
-                # expects them as MODULE_FEDERATION_REMOTE_ENTRY endpoints.
+                # Report the remoteEntry.js URL itself (it reveals a remote app).
                 analyzer.add_endpoint(
                     _ext_url, 'GET', [], 'MODULE_FEDERATION_REMOTE_ENTRY',
                     'ExternalJSCrawl', 'BACKEND_API', 80
                 )
                 print(f"    \u2713 {_ext_url.split('/')[-1]} ({len(code):,} bytes)")
 
-                # FIX EP-B-003/004: remoteEntry.js is a tiny loader stub — the actual
+                # remoteEntry.js is a tiny loader stub — the actual
                 # module code (with API endpoints in __webpack_modules__) lives in main.js
                 # beside it. Follow import('./main.js') references and run the FULL
                 # analyze_code() pipeline (Pattern E, Pattern 2b, EXTERNAL_SUBDOMAIN_LITERAL).
                 _main_js_candidates = set()
                 for _imp_m in re.finditer(
-                    r'import\s*\(\s*["\'](\./[^"\']+\.js)["\']',
+                    # import("./main.js") or import(publicPath + "main.js")
+                    r'import\s*\(\s*(?:[\w.$]+\s*\+\s*)?["\']((?:\./)?[\w./-]+\.js)["\']',
                     code
                 ):
                     _rel = _imp_m.group(1).lstrip('./')
@@ -342,7 +348,7 @@ def phase1_85_external_js(session, target, analyzer, js_files, ext_links, static
                 # Also try ./main.js as a heuristic for all remoteEntry.js siblings
                 _base_dir = _ext_url.rsplit('/', 1)[0]
                 _main_js_candidates.add(f"{_base_dir}/main.js")
-                for _mjs_url in _main_js_candidates:
+                for _mjs_url in sorted(_main_js_candidates):
                     if _mjs_url in set(js_files):
                         continue
                     try:
@@ -366,14 +372,13 @@ def phase1_85_external_js(session, target, analyzer, js_files, ext_links, static
                 pass
         _new_ext = len(analyzer.endpoints) - _snap_ext
         if _new_ext:
-            static_endpoints.extend(analyzer.endpoints[_snap_ext:])
             print(f"[PHASE 1.85] +{_new_ext} endpoint(s) from external JS bundles")
         # Also harvest source maps from external JS
         _, _ext_maps = run_sourcemap_harvest(session, target, _ext_js_urls, analyzer, output_dir=sourcemap_dir)
         if _ext_maps:
-            found_maps = list(set(found_maps or []) | set(_ext_maps))
+            found_maps = sorted(set(found_maps or []) | set(_ext_maps))
 
-        # FIX EP-B-004/EP-B-016: harvest source maps for the recursively-discovered
+        # Harvest source maps for the recursively-discovered
         # main.js files too (remoteEntry.js is only ever a loader stub — the actual
         # module code, and its source map, lives in the sibling main.js).
         if _recursive_main_js_urls:
@@ -381,14 +386,12 @@ def phase1_85_external_js(session, target, analyzer, js_files, ext_links, static
                   "recursively-discovered remote bundle(s)...")
             _snap_recur = len(analyzer.endpoints)
             _, _recur_maps = run_sourcemap_harvest(
-                session, target, list(_recursive_main_js_urls), analyzer, output_dir=sourcemap_dir
+                session, target, sorted(_recursive_main_js_urls), analyzer, output_dir=sourcemap_dir
             )
-            _new_from_recur = analyzer.endpoints[_snap_recur:]
-            if _new_from_recur:
-                static_endpoints.extend(_new_from_recur)
-                print(f"[PHASE 1.85] +{len(_new_from_recur)} endpoint(s) from recursive remote bundle source maps")
+            if len(analyzer.endpoints) > _snap_recur:
+                print(f"[PHASE 1.85] +{len(analyzer.endpoints) - _snap_recur} endpoint(s) from recursive remote bundle source maps")
             if _recur_maps:
-                found_maps = list(set(found_maps or []) | set(_recur_maps))
+                found_maps = sorted(set(found_maps or []) | set(_recur_maps))
     return found_maps
 
 
@@ -404,10 +407,9 @@ def phase3_dynamic(target, analyzer, cookies, args, auth_headers, ext_links, sta
         auth_headers=auth_headers,
     )
     interceptor._ext_link_extractor = ext_links   # Phase 3 hook
-    dynamic_endpoints = interceptor.run(static_endpoints)
-
-    # Add any endpoints discovered during dynamic phase back to static
-    static_endpoints.extend(analyzer.endpoints)
+    analyzer.current_phase = '3'
+    # run() records every observed request as runtime evidence in the store
+    dynamic_endpoints = interceptor.run(analyzer.endpoints)
     return interceptor, dynamic_endpoints
 
 
@@ -419,24 +421,23 @@ def phase1_5b_phase3_sourcemaps(session, target, analyzer, interceptor, js_files
     # never fetched. Do a second pass now using the analyzer's tracked set.
     phase3_js = getattr(interceptor, 'analyzed_js_files', set())
     phase1_js = set(js_files)
-    new_js_from_phase3 = [u for u in phase3_js if u not in phase1_js and u.endswith('.js')]
+    analyzer.current_phase = '1.5b'
+    new_js_from_phase3 = sorted(u for u in phase3_js if u not in phase1_js and u.endswith('.js'))
     if new_js_from_phase3:
         print(f"\n[PHASE 1.5b] Source map harvest for {len(new_js_from_phase3)} Phase-3-only JS bundle(s)...")
         _snap15b = len(analyzer.endpoints)
         _, extra_maps_b = run_sourcemap_harvest(session, target, new_js_from_phase3, analyzer, output_dir=sourcemap_dir)
-        _new_from_15b = analyzer.endpoints[_snap15b:]
-        if _new_from_15b:
-            static_endpoints.extend(_new_from_15b)
-            print(f"[PHASE 1.5b] +{len(_new_from_15b)} endpoint(s) from Phase-3 bundle source maps")
+        if len(analyzer.endpoints) > _snap15b:
+            print(f"[PHASE 1.5b] +{len(analyzer.endpoints) - _snap15b} endpoint(s) from Phase-3 bundle source maps")
         if extra_maps_b:
-            found_maps = list(set(found_maps or []) | set(extra_maps_b))
+            found_maps = sorted(set(found_maps or []) | set(extra_maps_b))
     return found_maps
 
 
 def _promote_external_links(session, json_files, ext_links, analyzer):
     """Feed JSON configs to the link extractor, then promote same-org API links to endpoints."""
     # Feed JSON configs into external link extractor before saving
-    for jf in json_files:
+    for jf in sorted(set(json_files)):
         try:
             r = session.get(jf, timeout=8, verify=False)
             if r.status_code == 200:
@@ -451,6 +452,7 @@ def _promote_external_links(session, json_files, ext_links, analyzer):
     # into the main endpoint pool. These are same-org subdomains (e.g. rcowgis.ril.com)
     # carrying real API paths. Previously they were classified correctly but silently
     # dropped from the endpoint pool — only appearing in the external_links report section.
+    analyzer.current_phase = '4-links'
     _PROMOTABLE_TIERS = {'INTERNAL_SUBDOMAIN', 'SSO_AUTH'}
     _NOISE_PATH_RE = re.compile(
         r'(?:\.(js|css|png|jpg|svg|woff|ttf|eot|ico|gif|map)$'
@@ -489,7 +491,7 @@ def _write_report(args, static_endpoints, dynamic_endpoints, found_maps, interce
     """Phase 4/5: JSON + Excel report and the output-location banner."""
     output_file = args.output or 'results.json'   # only used by save_report as a naming fallback
 
-    save_report(static_endpoints, dynamic_endpoints, output_file,
+    save_report(analyzer.endpoints, dynamic_endpoints, output_file,
                 source_maps=found_maps, interceptor=interceptor,
                 ext_links=ext_links, backend_findings=backend_findings,
                 target_url=target,
@@ -519,7 +521,7 @@ def _write_report(args, static_endpoints, dynamic_endpoints, found_maps, interce
 def _print_troubleshooting(static_endpoints, dynamic_endpoints):
     """Hints printed when the scan found nothing."""
     # Final summary
-    total = len(set([f"{e['method']}:{e['endpoint']}" for e in static_endpoints + dynamic_endpoints]))
+    total = len(static_endpoints) + len(dynamic_endpoints)
     if total == 0:
         print("\n" + "="*70)
         print("NO ENDPOINTS FOUND - TROUBLESHOOTING")
@@ -553,6 +555,10 @@ def run_scan(args, target, session, cookies, auth_headers, rate_limiter, scan_ca
                                       scan_cache=scan_cache,
                                       workers=args.workers,
                                       fetch_timeout=args.timeout)
+    # Relative references resolve against the page's <base href>, like a browser
+    _base_m = re.search(r'<base\s[^>]*href=["\']([^"\']+)["\']', hunter.raw_html or '', re.I)
+    if _base_m:
+        analyzer.normalizer.set_base_href(_base_m.group(1))
 
     js_files, found_maps = phase1_5_sourcemaps(session, target, js_files, analyzer, sourcemap_dir)
     static_endpoints = phase2_static_analysis(analyzer, js_files, json_files)

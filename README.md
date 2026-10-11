@@ -12,7 +12,7 @@ Modern SPAs don't put their API URLs in the HTML. They assemble them at runtime 
 
 Shadow Endpoints runs a multi-phase pipeline across every available evidence layer: static AST analysis, source map decompilation, dynamic browser instrumentation, GraphQL introspection, WebSocket discovery and automated authentication. It scores every candidate with a Bayesian confidence model. The result is a ranked, tiered endpoint list with full provenance for each finding.
 
-On the SPABench controlled benchmark (5 Dockerized SPAs, 45 ground-truth endpoints): **100% technique coverage, 97.7% precision** (Wilson 95% CI: 95.7%–98.8%). Against 5 production enterprise targets: **284–612 endpoints per target** at <1% false positive rate.
+Evaluation results are being re-measured on SPABench v3.0.0 with the benchmark-specific rules removed from the scanner (see "Benchmark de-tuning" in `REFACTOR_NOTES.md`). Numbers will be added here only when produced by the benchmark's runner scripts.
 
 ---
 
@@ -172,10 +172,9 @@ The prior is `P(API) = 0.35`. There are 47 signals, each with a likelihood ratio
 The scorer also implements `calibrate_from_labels()`: MLE-based LR calibration from labeled ground truth, with Laplace smoothing (Jeffreys prior α = 0.5). It computes Wilson 95% CIs for per-tier precision reporting.
 
 `save_report()` then:
-1. Adds `{id}` variants for REST collections.
-2. Merges static and dynamic results, de-duplicating on URL.
-3. Applies the final noise filter.
-4. Writes the JSON report and prints the console summary.
+1. Merges static and dynamic results, de-duplicating on URL.
+2. Applies the final noise filter.
+3. Writes the JSON report and prints the console summary.
 
 `json_to_excel()` then writes the spreadsheet.
 
@@ -373,7 +372,7 @@ The report's top-level sections:
 | `discovered_source_maps`, `ts_architecture_catalog`, `ts_declaration_files`, `webpack_module_paths` | source-map intelligence |
 | `backend_intelligence` | Swagger specs, backend maps and actuator routes found in Phase 1.8 |
 
-The format is unchanged by the refactor, so SPABench's `evaluate.py` scores it exactly as before.
+The format is unchanged by the refactor; SPABench's `evaluate.py` reads it with `--format spabench-v1`.
 
 ---
 
@@ -582,7 +581,7 @@ refactored/
 - **New scan phase:** a function in `pipeline.py`, called from `run_scan()`.
 - **Report fields:** `_build_report()` in `reporting/report.py` (keep `evaluate.py` compatibility).
 
-Inline comments such as `FIX EP-B-003`, `TC-P1.5-007` and `FP-5` were kept verbatim. They map to SPABench manifest endpoint IDs and test cases, so grep for them to find the regression a line guards against.
+Benchmark test-case IDs (`EP-…`, `TC-…`) were removed from the comments together with the benchmark-specific rules they marked; the remaining `FIX FP-n` tags are internal false-positive fix numbers. Do not add rules that encode a particular benchmark's ports, file names or paths.
 
 ---
 

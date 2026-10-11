@@ -12,7 +12,7 @@ class PreprocessingMixin:
         # ── FP FIX 1: Strip ONLY inline double-slash comments on non-URL lines ──
         # Prevents: // fetch('/api/old') from emitting endpoints.
         # IMPORTANT: Does NOT strip JSDoc block comments (/** ... */) because
-        # SPABench and real codebases embed valid endpoint hints in JSDoc.
+        # Real codebases embed valid endpoint hints in JSDoc.
         # Only removes single-line // comments where the comment itself is the
         # entire meaningful content of the line (i.e. the // is not inside a string).
         # We use a line-by-line approach to avoid stripping JSDoc blocks.

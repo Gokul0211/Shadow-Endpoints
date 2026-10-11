@@ -137,3 +137,15 @@ package layout and corrected wherever it disagreed with the code:
 - The output location and JSON entry format match what the code actually writes.
 - The pipeline section follows the real execution order and names each module.
 - `--cache/--resume`, `--output` and `--quiet` are described as they actually behave.
+
+## Benchmark de-tuning (2026-10-11) — intentional behaviour changes
+
+From here on the package **no longer matches `main.py`** on SPABench targets, on purpose. Code
+that encoded SPABench answers was removed or generalised: backend port sweeps (`4001–4004`),
+`:300x→:4001` login rewrites, benchmark file names (WSDL, workers, Next.js chunk wordlist),
+blocklist entries copied from the noise manifest, a `/vN/…` filter that dropped real
+ground-truth endpoints, `{id}` URL variants invented to match manifest templates, and an
+actuator URL reported on the SPA origin without being requested. Replacements are general:
+Next.js `_buildManifest` + runtime chunk map, WSDL URLs referenced in the analysed JS,
+first-party JS on the target's host or sibling subdomains, NgModule-name lazy-load filter.
+Full list with reasons: `vibe/spabench-changelog.md`, "Phase 9".

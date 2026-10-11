@@ -6,6 +6,7 @@ import re
 import urllib.parse
 
 from shadow_scanner.config import logger
+from shadow_scanner import config
 # ==============================================================================
 # SOURCE MAP ENGINE - LEGITIMATE PASSIVE EXTRACTION
 # ==============================================================================
@@ -519,6 +520,8 @@ class SourceMapEngine:
         from known JS bundle URLs.  These files reveal service interfaces, type
         signatures, and exported API shapes without any embedded source code.
         """
+        if not config.PROBING_ENABLED:          # guessed .d.ts paths are probes
+            return
         probed = 0
         found = 0
         dts_files = getattr(self, 'dts_files', [])
@@ -602,7 +605,7 @@ def run_sourcemap_harvest(session, target, js_files, analyzer, output_dir=None):
             getattr(existing, 'extracted_files', []) +
             getattr(engine, 'extracted_files', [])
         ))
-        # FIX EP-B-003/004: merge subapp_js_urls so Phase 1.85 sub-app discoveries
+        # merge subapp_js_urls so Phase 1.85 sub-app discoveries
         # are not silently dropped when the engine is discarded.
         existing.subapp_js_urls = list(set(
             getattr(existing, 'subapp_js_urls', []) +
@@ -639,7 +642,7 @@ def run_sourcemap_harvest(session, target, js_files, analyzer, output_dir=None):
                     ts_registered += n
                 # Feed into endpoint analysis pipeline
                 analyzer.analyze_code_from_dynamic(code, filepath)
-                # TC-P1.5-007 GRAPHQL REMAP SIGNAL: scan sourcemap source content
+                # GraphQL remap signal: scan sourcemap source content
                 # for absolute GraphQL URLs matching the SPA host.
                 # api-graphql.js.map source contains "http://localhost:3005/graphql"
                 # → this is the definitive signal that the SPA hosts GraphQL at /graphql.
@@ -688,7 +691,7 @@ def run_sourcemap_harvest(session, target, js_files, analyzer, output_dir=None):
                     code = r.text
                     if len(code) < 100:
                         continue
-                    # FIX EP-B-003/004: use full analyze_code() pipeline (not the lighter
+                    # use full analyze_code() pipeline (not the lighter
                     # analyze_code_from_dynamic) so Pattern E (webpack individual module
                     # assignments), Pattern 2b (this.X = this.Y + this.Z concatenation),
                     # Pattern 11 (this.http.get(this.A + this.B)), and
@@ -709,7 +712,7 @@ def run_sourcemap_harvest(session, target, js_files, analyzer, output_dir=None):
                     try:
                         with open(filepath, 'r', encoding='utf-8') as f:
                             code = f.read()
-                        # FIX EP-B-003/004: full pipeline for extracted source files too
+                        # full pipeline for extracted source files too
                         analyzer.analyze_code(code, filepath)
                     except Exception:
                         pass

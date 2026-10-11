@@ -251,134 +251,45 @@ class WebpackChunkHarvester:
 
 def _discover_nextjs_chunks(session, base_url, existing_js_files):
     """
-    TC-P1.5-007 / backend_sourcemap_recovery:
-    When Next.js is detected (any discovered JS URL contains /_next/), enumerate
-    additional chunks from /_next/static/chunks/ that are NOT linked from the HTML.
+    Next.js: find page and shared chunks the way the framework references them.
 
-    Next.js exposes API route bundles (api-graphql.js, api-auth.js, etc.) and
-    resolver/feature bundles as static files under /_next/static/chunks/.
-    These are NOT listed in buildManifest.json (which may not exist) and NOT
-    referenced from <script> tags — they are purely server-side route bundles
-    that nginx exposes as static files.
+    * the build manifest (/_next/static/<buildId>/_buildManifest.js, loaded by every
+      page) maps each route to its chunk files ("static/chunks/…js", relative to /_next/);
+    * the webpack runtime names every other chunk in its chunk-id → name map
+      ("static/chunks/" + {101: "name", …}[id] + ".js").
 
-    Strategy:
-    1. Check if any existing JS URL has /_next/static/ → confirms Next.js
-    2. Probe /_next/static/chunks/ as a directory (nginx may return listing)
-    3. Probe a comprehensive list of semantic chunk names used by Next.js apps
-       covering: API routes (api-*.js), resolvers (*.resolver.js), pages,
-       services, hooks, utils, and common Next.js internals
-    4. Return all discovered URLs for sourcemap processing
-
-    RCA: App E (nextjs-saas) has api-graphql.js.map with source content
-    containing "http://localhost:3005/graphql" — the literal SPA-local GraphQL
-    URL. And *.resolver.js.map files contain "/graphql#operationName" patterns.
-    These files are served by nginx but never linked from HTML, so the standard
-    Phase 1 discovery misses them entirely. This function adds them.
+    Nothing is guessed by file name.
     """
-    # Only activate when Next.js is confirmed
-    is_nextjs = any('/_next/' in u for u in existing_js_files)
-    if not is_nextjs:
+    if not any('/_next/' in u for u in existing_js_files):
         return []
-
     base = base_url.rstrip('/')
-    chunks_base = f"{base}/_next/static/chunks"
     known = set(existing_js_files)
     discovered = []
 
-    print("  [NEXT.JS CHUNKS] Enumerating hidden /_next/static/chunks/ bundles...")
+    def add(rel):
+        url = f"{base}/_next/{rel.lstrip('/')}"
+        if url not in known:
+            known.add(url)
+            discovered.append(url)
 
-    # Step 1: Try directory listing (works if nginx has autoindex on)
-    try:
-        _r = session.get(chunks_base + '/', timeout=5, verify=False)
-        if _r.status_code == 200 and 'text/html' in _r.headers.get('Content-Type',''):
-            # Parse href links from directory listing
-            _hrefs = [m.group(1) for m in re.finditer(rb'href=[^>]+?([\w./-]+[.]js)', _r.content)]
-            for h in _hrefs:
-                if h.startswith('/'):
-                    url = f"{base}{h}"
-                elif h.startswith('http'):
-                    url = h
-                else:
-                    url = f"{chunks_base}/{h}"
-                if url not in known:
-                    discovered.append(url)
-                    known.add(url)
-    except Exception:
-        pass
-
-    if discovered:
-        print(f"    [+] Directory listing: {len(discovered)} chunk(s)")
-        return discovered
-
-    # Step 2: Heuristic probe list — covers API routes, resolvers, services,
-    # hooks, pages, utils, and common Next.js internals
-    _heuristic_names = [
-        # API route chunks (pages/api/*.ts → api-NAME.js)
-        'api-graphql', 'api-auth', 'api-users', 'api-user',
-        'api-dashboard', 'api-data', 'api-search', 'api-admin',
-        'api-config', 'api-health', 'api-status', 'api-webhook',
-        'api-stripe', 'api-payment', 'api-billing', 'api-email',
-        'api-upload', 'api-image', 'api-file', 'api-export',
-        'api-import', 'api-report', 'api-analytics', 'api-metrics',
-        'api-notifications', 'api-messages', 'api-chat', 'api-rooms',
-        'api-orders', 'api-products', 'api-cart', 'api-checkout',
-        'api-teams', 'api-members', 'api-roles', 'api-permissions',
-        'api-settings', 'api-profile', 'api-account',
-        # GraphQL resolver chunks
-        'user.resolver', 'order.resolver', 'product.resolver',
-        'dashboard.resolver', 'team.resolver', 'billing.resolver',
-        'audit.resolver', 'checkout.resolver', 'payment.resolver',
-        'notification.resolver', 'message.resolver', 'search.resolver',
-        'analytics.resolver', 'admin.resolver', 'auth.resolver',
-        # Service/feature chunks
-        'graphql-auth', 'graphql-client', 'graphql-config',
-        'dash-service', 'notif-service', 'auth-service',
-        'user-service', 'order-service', 'product-service',
-        'metrics-component', 'dashboard-component',
-        # Hook chunks
-        'hooks-auth', 'hooks-ws', 'hooks-api', 'hooks-data',
-        'hooks-user', 'hooks-graphql',
-        # Util/type chunks
-        'utils-api', 'utils-auth', 'utils-graphql', 'utils-totp',
-        'types-api', 'types-graphql', 'types-user',
-        # Config/runtime
-        'config', 'settings', 'constants', 'schema',
-        # Next.js standard chunks
-        'polyfills', 'framework', 'webpack-runtime',
-        '_app', '_document', '_error',
-        'index', 'login', 'register', 'dashboard',
-        'billing', 'settings', 'team', 'profile',
-        'context-auth', 'context-user', 'context-theme',
-        'package', 'tsconfig',
-    ]
-
-    probed = 0
-    found = 0
-    for name in _heuristic_names:
-        url = f"{chunks_base}/{name}.js"
-        if url in known:
+    print("  [NEXT.JS CHUNKS] Reading the build manifest and runtime chunk map...")
+    for u in list(existing_js_files):
+        name = u.rsplit('/', 1)[-1].split('?')[0]
+        if '/_next/' not in u or not (name.startswith('_buildManifest') or 'webpack' in name or 'runtime' in name):
             continue
-        probed += 1
         try:
-            r = session.get(url, timeout=4, verify=False)
-            if r.status_code == 200 and len(r.content) > 10:
-                # Quick sanity check: should look like JS
-                content_type = r.headers.get('Content-Type', '').lower()
-                body_start = r.text.strip()[:20].lower()
-                if ('javascript' in content_type or
-                        body_start.startswith('(()=>{') or
-                        body_start.startswith('(function') or
-                        body_start.startswith('//')  or
-                        '//# sourceMappingURL' in r.text):
-                    discovered.append(url)
-                    known.add(url)
-                    found += 1
+            r = session.get(u, timeout=8, verify=False)
         except Exception:
-            pass
+            continue
+        if r.status_code != 200:
+            continue
+        text = r.text
+        for rel in re.findall(r'"(static/(?:chunks|css)/[^"]+?\.js)"', text):
+            add(rel)
+        for prefix, mapping in re.findall(r'"(static/chunks/)"\s*\+\s*\(?\s*(\{[^{}]*\})', text):
+            for chunk in re.findall(r':\s*"([^"]+)"', mapping):
+                add(f"{prefix}{chunk}.js")
 
-    if found:
-        print(f"    [+] Heuristic probing: {found}/{probed} chunk(s) found")
-    else:
-        print(f"    [-] No additional chunks found ({probed} names probed)")
-
+    print(f"    [+] {len(discovered)} chunk(s) referenced by the build manifest / runtime" if discovered
+          else "    [-] No additional chunks referenced")
     return discovered

@@ -4,6 +4,26 @@ import urllib.parse
 class DynamicImportsMixin:
     """Collects lazy-loaded chunk URLs into self._dynamic_imports (fetched later by scan())."""
 
+    def _import_url(self, raw, referrer):
+        """Absolute http(s) URL for an import path, or None.
+
+        Relative paths ("./x.js") are resolved only against a real URL
+        referrer: for code recovered from a source map the referrer is a local
+        file of the original source tree, which says nothing about where the
+        built chunk is served. Root-relative paths resolve against the target.
+        """
+        raw = (raw or '').strip().strip('"\'`')
+        if not raw:
+            return None
+        if raw.startswith(('http://', 'https://')):
+            return raw
+        ref = (referrer or '').split('::', 1)[0]
+        if raw.startswith('/'):
+            return urllib.parse.urljoin(self.normalizer.base_url + '/', raw)
+        if ref.startswith(('http://', 'https://')):
+            return urllib.parse.urljoin(ref, raw)
+        return None
+
     def _queue_dynamic_imports(self, code, source):
         """import() / require.ensure / __webpack_require__ / dynamic() call sites."""
         # ── GAP 2 FIX: Extract ALL dynamic import() forms ─────────────────
@@ -110,12 +130,7 @@ class DynamicImportsMixin:
             r'[\'"`]([^\'"`]{3,200}\.(?:js|mjs|cjs|ts|jsx|tsx))[\'"`]',
             code, re.IGNORECASE
         ):
-            chunk_path = m.group(1)
-            # Resolve relative paths against the source file URL
-            try:
-                abs_url = urllib.parse.urljoin(source, chunk_path)
-            except Exception:
-                abs_url = chunk_path
+            abs_url = self._import_url(m.group(1), source)
             if abs_url and abs_url not in self.analyzed_js_files:
                 self._dynamic_imports.add(abs_url)
 
@@ -126,11 +141,7 @@ class DynamicImportsMixin:
             code, re.IGNORECASE
         ):
             for path_m in re.finditer(r'[\'"`]([^\'"`]{3,200}\.(?:js|mjs|jsx))[\'"`]', m.group(1)):
-                chunk_path = path_m.group(1)
-                try:
-                    abs_url = urllib.parse.urljoin(source, chunk_path)
-                except Exception:
-                    abs_url = chunk_path
+                abs_url = self._import_url(path_m.group(1), source)
                 if abs_url and abs_url not in self.analyzed_js_files:
                     self._dynamic_imports.add(abs_url)
 
@@ -158,15 +169,8 @@ class DynamicImportsMixin:
                 return None
             if raw.startswith('http'):
                 return raw
-            if raw.startswith('./') or raw.startswith('../'):
-                # Resolve relative to the source file's directory
-                src_dir = '/'.join(source.split('/')[:-1]) if '/' in source else _base_prefix
-                try:
-                    return urllib.parse.urljoin(src_dir + '/', raw)
-                except Exception:
-                    return None
-            if raw.startswith('/'):
-                return _base_prefix + raw
+            if raw.startswith(('./', '../', '/')):
+                return self._import_url(raw, source)
             return None
 
         # Form 1: import("./chunk") — dynamic import expression
@@ -244,15 +248,9 @@ class DynamicImportsMixin:
         # Skip non-JS assets
         if raw.endswith(('.css', '.png', '.svg', '.json')):
             return
-        # Resolve to absolute URL
-        if raw.startswith('http://') or raw.startswith('https://'):
-            abs_url = raw
-        else:
-            try:
-                base = referrer_url or self.base_url
-                abs_url = urllib.parse.urljoin(base, raw)
-            except Exception:
-                return
+        abs_url = self._import_url(raw, referrer_url)
+        if not abs_url:
+            return
         # Only enqueue same-origin or explicitly set JS files
         try:
             ref_host = urllib.parse.urlparse(self.base_url).netloc

@@ -2,6 +2,7 @@
 import re
 
 from shadow_scanner.config import logger
+from shadow_scanner import config
 # ==============================================================================
 # FEATURE 1: SERVICE WORKER ANALYZER
 # ==============================================================================
@@ -31,7 +32,6 @@ class ServiceWorkerAnalyzer:
         # Standalone workers spawned via new Worker('/path') -- these fire API calls
         # but are completely invisible to the HTML/SW registration scanner.
         '/worker.js', '/app.worker.js', '/background.worker.js',
-        '/recommendation.worker.js', '/background-sync.worker.js',
         '/push.worker.js', '/cache.worker.js', '/sync.worker.js',
     ]
 
@@ -170,7 +170,7 @@ class ServiceWorkerAnalyzer:
                 urls.append(self._resolve(m.group(1)))
 
         # 3. Fixed candidate paths (404s are silently ignored)
-        for path in self._CANDIDATE_PATHS:
+        for path in (self._CANDIDATE_PATHS if config.PROBING_ENABLED else []):
             urls.append(self.base_url + path)
 
         # Deduplicate while preserving order

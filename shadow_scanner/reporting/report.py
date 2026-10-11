@@ -6,7 +6,7 @@ import time
 import urllib.parse
 from collections import defaultdict
 
-from shadow_scanner.config import PLAYWRIGHT_AVAILABLE
+from shadow_scanner.config import PLAYWRIGHT_AVAILABLE, is_ignored_url
 from shadow_scanner.core.scoring import BayesianConfidenceScorer
 from shadow_scanner.reporting.excel import json_to_excel
 
@@ -69,54 +69,6 @@ def _extract_security_findings(results: list) -> list:
     return findings
 
 
-# ── SPABench evaluate.py matching fix ─────────────────────────────────
-# evaluate.py url_matches() treats any {param} wildcard segment as matching
-# any single path segment.  Two common mismatches:
-#
-# 1. Trailing slash: scanner emits /api/v2/products/ but manifest has
-#    /api/v2/products/{id}.  evaluate.py segments differ: [] vs ['{id}'].
-#    Fix: for every collection endpoint (path ends with /) add a {id} variant.
-#
-# 2. Numeric segment: scanner emits /api/users/123 → evaluate.py already
-#    matches this correctly (numeric = any segment).  No fix needed.
-#
-# Both fixes run BEFORE merging so duplicates are deduped normally.
-
-_COLLECTION_SEGMENTS = re.compile(
-    r'/(?:user|order|product|permit|item|record|entry|report|doc|file|'
-    r'invoice|ticket|request|task|issue|asset|template|group|team|member|'
-    r'role|resource|entity|object|node|event|session|token)s?$',
-    re.IGNORECASE
-)
-
-
-def _expand_with_id_variant(items):
-    """For collection endpoints (path ends with trailing /), add a /{id} variant."""
-    expanded = list(items)
-    for item in items:
-        ep_url = item.get('endpoint', '')
-        try:
-            parsed = urllib.parse.urlparse(ep_url)
-            path   = parsed.path
-            # Add /{id} variant if endpoint looks like a REST collection
-            if path.endswith('/') or _COLLECTION_SEGMENTS.search(path.rstrip('/')):
-                base_path = path.rstrip('/')
-                id_url = urllib.parse.urlunparse((
-                    parsed.scheme, parsed.netloc,
-                    base_path + '/{id}',
-                    parsed.params, parsed.query, parsed.fragment
-                ))
-                id_item = dict(item)
-                id_item['endpoint']         = id_url
-                id_item['confidence_score']  = max(40, item.get('confidence_score', 60) - 10)
-                id_item['type']              = item.get('type', '') + '_ID_VARIANT'
-                id_item['_id_variant']       = True
-                expanded.append(id_item)
-        except Exception:
-            pass
-    return expanded
-
-
 def _prepare_output_paths(filename, target_url):
     """Create output/<domain>/{json,excel,sourcemaps,backend}/ and return file paths."""
     # ── Build organized output directory structure ────────────────────────────
@@ -145,103 +97,21 @@ def _prepare_output_paths(filename, target_url):
     return json_path, excel_path, output_root
 
 
-def _merge_endpoints(static, dynamic, target_url):
-    """Merge static + dynamic results, de-duplicating on URL only."""
-    # Merge and deduplicate on URL-only key (not method+URL).
-    # This collapses duplicates that arise when ARRAY_HARVEST and STATIC_CODE
-    # find the same endpoint — ARRAY_HARVEST defaults to GET, STATIC_CODE gets
-    # the real method. We keep the highest-confidence entry's method.
-    # ── Fix 3: Normalise same-machine port variations to target host ────────
-    # Endpoints extracted from obfuscated string arrays may embed a different
-    # localhost port (e.g. localhost:4001 backend vs localhost:3001 target).
-    # Rewrite them so evaluate.py can match them as true positives.
-    _target_parsed = urllib.parse.urlparse(target_url) if target_url else None
-    _target_netloc = _target_parsed.netloc if _target_parsed else None
-    _target_hostname = _target_parsed.hostname if _target_parsed else None
-
-    def _normalise_host(ep_url):
-        """
-        Unify localhost / 127.0.0.1 hostname representation (same port only).
-
-        RC1-FIX: Only normalises hostname when ports match.
-        evaluate.py matching fix: preserves cross-port API references.
-        """
-        if not _target_netloc:
-            return ep_url
-        try:
-            ep_parsed = urllib.parse.urlparse(ep_url)
-            ep_host = ep_parsed.hostname
-            ep_port = ep_parsed.port
-            target_port = _target_parsed.port
-            if ep_host in ('localhost', '127.0.0.1') and _target_hostname in ('localhost', '127.0.0.1'):
-                if ep_port == target_port and ep_parsed.netloc != _target_netloc:
-                    return ep_url.replace(ep_parsed.netloc, _target_netloc, 1)
-        except Exception:
-            pass
-        return ep_url
-
-    merged = {}
-    for item in static + dynamic:
-        item['endpoint'] = _normalise_host(item['endpoint'])
-        key = item['endpoint'].rstrip('/')          # URL-only key
-        if key not in merged:
-            merged[key] = dict(item)               # first occurrence
-        else:
-            existing = merged[key]
-            # Dynamic verified calls always win
-            if item.get('type', '').startswith('DYNAMIC'):
-                existing['classification'] = 'VERIFIED_API'
-                existing['confidence_score'] = 100
-                existing['type'] = item['type']
-                existing['method'] = item.get('method', existing['method'])
-            else:
-                new_conf = item.get('confidence_score', 0)
-                old_conf = existing.get('confidence_score', 0)
-                if new_conf > old_conf:
-                    # Higher confidence: take its method and type
-                    existing['method'] = item['method']
-                    existing['type'] = item['type']
-                    existing['confidence_score'] = new_conf
-                elif item.get('method', 'GET') != 'GET' and existing.get('method') == 'GET':
-                    # Specific method always beats default GET fallback
-                    existing['method'] = item['method']
-            # ── Fix 5: Only merge parameters from same extraction type ──
-            # ARRAY_HARVEST extracts path suffixes from the same source file,
-            # which can cross-contaminate parameters across endpoints.
-            # Only merge if both items share the same extraction category.
-            _new_type = item.get('type', '')
-            _old_type = existing.get('type', '')
-            _is_array_harvest_new = 'ARRAY' in str(_new_type).upper()
-            _is_array_harvest_old = 'ARRAY' in str(_old_type).upper()
-            if _is_array_harvest_new == _is_array_harvest_old:
-                # Same extraction category — safe to merge params
-                existing['parameters'] = sorted(list(set(
-                    existing.get('parameters', []) + item.get('parameters', [])
-                )))[:10]
-            # else: skip param merge to avoid cross-contamination
-    return merged
+def _materialize(analyzer, endpoints):
+    """Report entries from the shared store: one per (URL, explicitly observed
+    method), scored from all evidence. Runtime requests were added to the same
+    store by Phase 3, so there is nothing left to merge."""
+    if analyzer is not None and hasattr(analyzer, 'materialize'):
+        return analyzer.materialize()
+    return [dict(e) for e in endpoints]      # fallback: already-final entries
 
 
-def _filter_endpoints(merged):
+def _filter_endpoints(entries):
     """Final noise-removal pass over the merged endpoints."""
     # ⭐ ENHANCED: Final filtering pass — comprehensive noise removal
-    pre_filter_count = len(merged)
+    pre_filter_count = len(entries)
     filtered_results = []
 
-    _HARD_BLOCKED_DOMAINS = {
-        'w3.org', 'xmlns.com', 'schema.org', 'schemas.openxmlformats.org',
-        'schemas.microsoft.com', 'openxmlformats.org', 'mozilla.org',
-        'purl.org', 'reactjs.org', 'react.dev',
-        'vimeo.com', 'vzaar.com',
-        'google.com', 'googleapis.com', 'gstatic.com',
-        'facebook.com', 'twitter.com', 'linkedin.com',
-        'cloudflare.com', 'cloudfront.net',
-        'sentry.io', 'datadog.com', 'newrelic.com',
-        'segment.io', 'hotjar.com', 'intercom.io',
-        'jsdelivr.net', 'cdnjs.cloudflare.com', 'unpkg.com',
-        'bootstrapcdn.com', 'fontawesome.com',
-        'microsoftonline.com',
-    }
 
     _STATIC_EXTENSIONS = {
         '.svg', '.png', '.jpg', '.jpeg', '.gif', '.webp', '.ico',
@@ -251,7 +121,7 @@ def _filter_endpoints(merged):
 
     _GARBAGE_PATTERNS = ['//', '/../', '/./']
 
-    for endpoint in merged.values():
+    for endpoint in entries:
         ep_url         = str(endpoint.get('endpoint', ''))
         ep_lower       = ep_url.lower()
         conf_score     = endpoint.get('confidence_score', 0)
@@ -260,7 +130,7 @@ def _filter_endpoints(merged):
         tags           = endpoint.get('tags', [])
 
         # 1. Hard-blocked domains
-        if any(d in ep_lower for d in _HARD_BLOCKED_DOMAINS):
+        if is_ignored_url(ep_url):
             continue
 
         # 2. External schema tag
@@ -277,10 +147,8 @@ def _filter_endpoints(merged):
             last = path.rsplit('/', 1)[-1]
             ext  = ('.' + last.rsplit('.', 1)[-1].lower()) if '.' in last else ''
 
-            # FIX MFE: Exempt localhost JS URLs from static extension filter to catch remoteEntry.js
-            exempt_js = False
-            if ext == '.js' and 'localhost:' in ep_lower:
-                exempt_js = True
+            # Module Federation entry points are reported (they reveal remote apps)
+            exempt_js = ext == '.js' and last.lower().startswith('remoteentry')
 
             if ext in _STATIC_EXTENSIONS and not exempt_js and not _is_websocket:
                 continue
@@ -307,7 +175,7 @@ def _filter_endpoints(merged):
         if classification == 'EXTERNAL_REFERENCE':
             continue
 
-        # 8. FIX FP-5: TC-NOISE-007 React component names masquerading as API paths
+        # 8. Component names (PascalCase single segment) masquerading as API paths
         # These are PascalCase single-segment paths with no API sub-path.
         try:
             _fp_path = urllib.parse.urlparse(ep_url).path
@@ -320,7 +188,7 @@ def _filter_endpoints(merged):
         except Exception:
             pass
 
-        # 9. FIX FP-5: TC-NOISE-008 pure SPA router paths emitted from ROUTER_NAV
+        # 9. Pure SPA router paths emitted from ROUTER_NAV
         # as BACKEND_API with no dynamic evidence and no API path indicator.
         _nav_types = ('ROUTER_NAV_THIS', 'ROUTER_NAV', 'ROUTE_NAV_THIS',
                       'ROUTE_NAV', 'HISTORY_PUSH', 'REACT_NAVIGATE', 'HASH_ROUTE')
@@ -371,11 +239,11 @@ def _collect_security_findings(results, analyzer):
 def _build_report(target_url, results, dynamic, interceptor, summary, source_maps,
                   base_security_findings, security_headers, ext_links,
                   sourcemap_engine, backend_findings):
-    """Assemble the JSON report dict (format consumed by SPABench evaluate.py)."""
+    """Assemble the JSON report dict (endpoint / confidence_score format)."""
     report = {
         "scan_metadata": {
-            "scanner":   "Advanced Endpoint Scanner - Enterprise Edition v2.0",
-            "version":   "2.0.0",
+            "scanner":   "shadow_scanner (refactored)",
+            "version":   "3.0.0-dev (Phase A)",
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
             "target":    target_url or "",
             "total_endpoints": len(results),
@@ -424,10 +292,16 @@ def _build_report(target_url, results, dynamic, interceptor, summary, source_map
         "security_headers": security_headers,
         # ── PROVENANCE SUMMARY — multi-source confirmed endpoints ─────────────
         "provenance_summary": {
+            # independent confirmation = evidence from 2+ provenance categories
             "multi_source_confirmed": len([
                 r for r in results
-                if r.get('origin', {}).get('provenance_sources', 1) > 1
+                if len(r.get('origin', {}).get('provenance', [])) > 1
             ]),
+            "by_evidence_kind": {
+                k: len([r for r in results if k in r.get('origin', {}).get('evidence_kinds', [])])
+                for k in ('runtime', 'spec', 'probe', 'storage', 'static')
+            },
+            "probe_only": len([r for r in results if r.get('probe_only')]),
             "runtime_verified": len([
                 r for r in results if r.get('classification') == 'VERIFIED_API'
             ]),
@@ -499,7 +373,7 @@ def _print_scan_summary(report, results, summary, ext_links, json_path):
             print(f"    {tech:<35} {cnt:>4}")
 
     # ── Provenance summary ─────────────────────────────────────────────────
-    _multi_src = len([r for r in results if r.get('origin', {}).get('provenance_sources', 1) > 1])
+    _multi_src = len([r for r in results if len(r.get('origin', {}).get('provenance', [])) > 1])
     _runtime   = len([r for r in results if r.get('classification') == 'VERIFIED_API'])
     if _multi_src or _runtime:
         print("\n  Provenance:")
@@ -615,13 +489,13 @@ def save_report(static, dynamic, filename="results.json", source_maps=None, inte
     save_report._last_json_path  = json_path
     save_report._last_excel_path = excel_path
 
-    static  = _expand_with_id_variant(static)
-    dynamic = _expand_with_id_variant(dynamic)
-    merged = _merge_endpoints(static, dynamic, target_url)
-    filtered_results = _filter_endpoints(merged)
+    entries = _materialize(analyzer, static)
+    filtered_results = _filter_endpoints(entries)
 
-    # Sort by Confidence Score
-    results = sorted(filtered_results, key=lambda x: x.get('confidence_score', 0), reverse=True)
+    # Stable order: score, then URL, then method (ties no longer depend on
+    # insertion order - S14)
+    results = sorted(filtered_results,
+                     key=lambda x: (-x.get('confidence_score', 0), x.get('endpoint', ''), x.get('method', '')))
 
     # Group by Category for Summary
     summary = defaultdict(int)
@@ -633,7 +507,7 @@ def save_report(static, dynamic, filename="results.json", source_maps=None, inte
                            base_security_findings, security_headers, ext_links,
                            sourcemap_engine, backend_findings)
 
-    with open(json_path, "w") as f:
+    with open(json_path, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2)
 
     _print_scan_summary(report, results, summary, ext_links, json_path)

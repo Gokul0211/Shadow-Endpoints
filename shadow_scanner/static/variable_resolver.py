@@ -79,7 +79,7 @@ class EnhancedVariableResolver:
             if var_name not in file_vars and not self._is_noise_value(var_value):
                 self._register_variable(var_name, var_value, filename, file_vars, 70)
 
-        # FIX EP-B-003: Pattern 2b — resolve this.X = this.Y + this.Z
+        # Pattern 2b — resolve this.X = this.Y + this.Z
         # Handles: this.odataBase = this.apiBase + this.inventoryEndpoint
         # where this.apiBase="http://localhost:3002" and this.inventoryEndpoint="/api/inventory/items"
         # are already registered in file_vars / this.variables

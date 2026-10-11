@@ -139,11 +139,6 @@ class AuthEngine:
         if not success and post_resp.status_code == 405:
             print("[AUTH]   405 detected — frontend SPA route, not an API endpoint.")
             api_login_candidates = [
-                login_url.replace(':3001', ':4001').replace('/login', '/api/auth/login'),
-                login_url.replace(':3002', ':4001').replace('/login', '/api/auth/login'),
-                login_url.replace(':3003', ':4001').replace('/login', '/api/auth/login'),
-                login_url.replace(':3004', ':4001').replace('/login', '/api/auth/login'),
-                login_url.replace(':3005', ':4001').replace('/login', '/api/auth/login'),
                 login_url.replace('/login', '/api/auth/login'),
                 login_url.replace('/login', '/api/login'),
                 login_url.replace('/login', '/auth/login'),

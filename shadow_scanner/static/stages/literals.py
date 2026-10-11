@@ -2,7 +2,7 @@
 import re
 import urllib.parse
 
-from shadow_scanner.config import IGNORED_DOMAINS, is_noise
+from shadow_scanner.config import is_ignored_host, is_noise
 class LiteralSweepMixin:
     """Broad string-literal sweeps (template literals, LinkFinder-style regexes, IPs, env vars)."""
 
@@ -182,8 +182,7 @@ class LiteralSweepMixin:
                              "TEMPLATE_LITERAL_RESOLVED", "BACKEND_API", 82)
 
     def _extract_api_string_literals(self, code, source):
-        """Quoted "/api/..." / "#/..." paths and api_<service>/<Method> literals."""
-        # String literals with API patterns (original: leading / or #)
+        """Quoted "/api/..." / "#/..." paths with an API indicator."""
         for m in re.finditer(r'["\']([/#][^\'"]{3,100}?)["\']', code):
             url = m.group(1)
             if self.has_api_pattern(url):
@@ -191,39 +190,6 @@ class LiteralSweepMixin:
                 if cls != "NOISE":
                     full_url = self.normalizer.normalize(url)
                     self.process(full_url, self.detect_method(code, m.start()), m.start(), code, source, "STATIC_CODE", cls, 50)
-
-        # RC2-FIX: String literals matching api_service/method pattern (no leading slash)
-        # Catches: 'api_rc_simops/CheckSimops', 'api_isolationtemplate/getAllIsolationTemplates', etc.
-        # The pattern is anchored to api_<service>/<method> so false positives are minimal.
-        for m in re.finditer(r'["\'`]((api_[a-z_]+/[A-Za-z]\w{2,})[^"\'`<>{}()\s]{0,120})["\'`]', code):
-            url = m.group(1)
-            # Skip if already caught by the leading-slash pattern above
-            if url.startswith('/') or url.startswith('#'):
-                continue
-            # Clean HTML-encoded ampersands that appear in minified JS
-            url = url.replace('&amp;', '&')
-            # BUGFIX: classify(url) directly - NOT classify('/' + url).
-            # Prepending '/' breaks the r'^api_[a-z_]+/' anchor in API_INDICATORS,
-            # causing endpoints like api_rc_simops/CheckSimops to return NOISE.
-            cls = self.classify(url)
-            # Force BACKEND_API: anything matching api_<svc>/<CamelMethod> IS an API call
-            # even if no other indicator fires (e.g. api_rc_simops/CheckSimops has no /get /post).
-            if cls == "NOISE":
-                cls = "BACKEND_API"
-            # BUGFIX: normalize(url) directly - NOT normalize('/' + url).
-            # URLNormalizer already handles bare paths by prepending scheme://netloc/
-            full_url = self.normalizer.normalize(url)
-            self.process(full_url, self.detect_method(code, m.start()), m.start(), code, source, "STATIC_CODE_API_PREFIX", cls, 72)
-
-        # RC2c-FIX: Catch api_* paths in template literals with ${} interpolation
-        # e.g. `${this.baseUrl}api_rc_permit/getHighRiskPermits`
-        # These are missed by the string-literal regex above because they appear inside backtick strings
-        for m in re.finditer(r'\}(api_[a-z_]+/[A-Za-z]\w{2,}[^`"\'<>{}\s]{0,80})[`"\']', code):
-            url = m.group(1).replace('&amp;', '&')
-            if url.startswith('/') or url.startswith('#'):
-                continue
-            full_url = self.normalizer.normalize(url)
-            self.process(full_url, self.detect_method(code, m.start()), m.start(), code, source, "STATIC_CODE_API_PREFIX", "BACKEND_API", 72)
 
     def _extract_external_subdomain_literals(self, code, source):
         """Full https:// URLs on other hosts that carry an API-looking path."""
@@ -241,20 +207,11 @@ class LiteralSweepMixin:
                 target_host = ''
             if ext_host == target_host:
                 continue
-            # Skip known noise / CDN / analytics / schema domains
-            _noise_dom = [
-                'w3.org', 'xmlns.com', 'schema.org', 'openxmlformats.org',
-                'schemas.microsoft.com', 'mozilla.org', 'reactjs.org', 'react.dev',
-                'cdnjs.', 'jsdelivr.', 'unpkg.', 'fontawesome', 'bootstrapcdn',
-                'google', 'facebook', 'twitter', 'linkedin', 'sentry', 'datadog',
-                'newrelic', 'segment', 'hotjar', 'optimizely', 'intercom',
-                'cloudflare', 'cloudfront', 'vimeo', 'vzaar', 'gstatic',
-                'microsoftonline', 'azure', 'chinacloudapi', 'opencagedata', 'tinymce',
-            ]
-            if any(nd in ext_host for nd in _noise_dom):
+            # Skip third-party hosts (analytics, CDNs, schema namespaces)
+            if is_ignored_host(ext_host):
                 continue
             # Must have a meaningful path that looks like an API call
-            if self.has_api_pattern(ext_url) or re.search(r'/[A-Z][a-z]|/api|/Api|/v\d|/sso|/auth|/token|/login|/gentoken|/getCurrentUser|/mysso|/signin|/fetchToken|/picture/|/download/|/docmgmt/', ext_url):
+            if self.has_api_pattern(ext_url) or re.search(r'/api\b|/Api\b|/v\d|/sso\b|/auth\b|/token\b|/login\b|/signin\b|/oauth2?\b', ext_url):
                 self.process(ext_url, self.detect_method(code, m.start()), m.start(), code, source, "EXTERNAL_SUBDOMAIN_LITERAL", "BACKEND_API", 80)
 
     def _linkfinder_sweep(self, code, source):
@@ -421,7 +378,7 @@ class LiteralSweepMixin:
                 continue
             if ext_host == target_host:
                 continue
-            if any(nd in ext_host for nd in IGNORED_DOMAINS):
+            if is_ignored_host(ext_host):
                 continue
             if is_noise(ext_url):
                 continue
