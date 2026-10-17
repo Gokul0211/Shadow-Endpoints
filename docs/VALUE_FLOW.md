@@ -107,9 +107,27 @@ HTTP API or only URL-shaped, library, wrapper chain (`via`), `uncalled`, request
 `params` option, `HttpParams`/`URLSearchParams` chains, `JSON.stringify` argument), and `auth` (an
 Authorization-style header at the sink). The scanner records each as evidence of type `VALUEFLOW_SINK`.
 
+### 6.1 Parameters (`request_info.js`)
+Names only. Sources: object-literal keys of the body argument and of the `params` / `data` / `body` options,
+`HttpParams` / `URLSearchParams` / `FormData` chains (also through a constant variable), `JSON.stringify(x)`, and
+the members of a declared TypeScript `interface` / object type used as the parameter type. When a request helper
+passes its own parameter on (`post(name, body) { return http.post(url + name, body) }`), the sink records a *flow*
+(function, parameter index, mode) and each call site completes the list from the argument it passes
+(`carryInfo`); flows chain through nested helpers.
+
+### 6.2 String-array de-obfuscation (`deobf.js`)
+Before indexing, a file is checked for the layout that javascript-obfuscator (and look-alikes) produce: a function
+returning a literal string array and overwriting itself, a decoder reading it with an index offset (plain, base64
+with the obfuscator's alphabet, or RC4 with a key argument), a rotation IIFE whose loop compares a `parseInt`
+checksum with a target, and wrapper functions / aliases in front of the decoder. The rotation is replayed with an
+evaluator for numeric constants, `+ - * / %`, `parseInt` and calls to the decoder / wrappers; every call with
+constant arguments is then rewritten to its string. Nothing from the target is executed; unrecognised layouts are
+left untouched. Control-flow proxies are handled by the ordinary evaluator: properties assigned one by one to a
+local object literal, forwarding helpers `function (f, a, b) { return f(a, b) }`.
+
 ## 7. Soundness, precision and limits
 
-* **Not sound.** Unresolvable by construction: `eval`/`new Function`, reflection and computed property *writes*,
+* **Not sound.** Unresolvable by construction: `eval`/`new Function`, string arrays whose decoder is not one of the three recognised kinds, reflection and computed property *writes*,
   URLs fetched from the server at run time, calls through arrays of functions or higher-order plumbing deeper
   than the call-depth bound, values that depend on user input. These become holes (or are missed).
 * **Bounded.** `K = 8` templates per value; call depth 5; wrapper chain depth 4; 40 call sites per wrapper;

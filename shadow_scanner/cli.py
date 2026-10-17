@@ -11,6 +11,7 @@ import argparse
 import contextlib
 import logging
 import os
+import random
 import sys
 
 import requests
@@ -19,6 +20,7 @@ from shadow_scanner.auth import AuthEngine
 from shadow_scanner.core.http_client import HttpClient
 from shadow_scanner.core.rate_limiter import RateLimiter
 from shadow_scanner.core.run_meta import RunRecorder, apply_env_secrets
+from shadow_scanner.core.scope import Scope
 from shadow_scanner.core.scan_cache import ScanCache
 from shadow_scanner.pipeline import run_scan
 from shadow_scanner.static.registry import PHASES, extractor_names
@@ -95,6 +97,20 @@ Examples:
                         help='Run only the named extractors (repeatable; add-one-in ablations).')
     parser.add_argument('--list-extractors', action='store_true',
                         help='Print the names accepted by --disable-extractor / --only-extractor and exit.')
+    parser.add_argument('--openapi', type=str, default=None, metavar='FILE',
+                        help='Also write the discovered API surface as an OpenAPI 3.0 JSON document.')
+    parser.add_argument('--postman', type=str, default=None, metavar='FILE',
+                        help='Also write the discovered API surface as a Postman v2.1 collection.')
+    parser.add_argument('--export-min-score', type=int, default=0, metavar='N',
+                        help='Leave endpoints scoring below N out of --openapi / --postman (default 0).')
+    parser.add_argument('--scope', action='append', default=[], metavar='HOST',
+                        help='Treat HOST (and its subdomains) as first-party in addition to the target\'s own site '
+                             '(repeatable). Credentials (tokens, cookies) are sent only to first-party hosts.')
+    parser.add_argument('--scope-strict', action='store_true',
+                        help='Do not send any request (HTTP or browser) to a host outside the scope. Without this '
+                             'flag such requests are still made (public scripts, fonts) but carry no credentials.')
+    parser.add_argument('--seed', type=int, default=0, metavar='N',
+                        help='Seed for the scanner\'s own randomness (request jitter); default 0.')
     parser.add_argument('--include-inferred', action='store_true',
                         help='Also report endpoints supported only by inference (e.g. pages/api/<file> routes '
                              'guessed from file names); they are left out by default.')
@@ -376,7 +392,12 @@ def main():
         _configure_verbose_logging(args)
         rate_limiter = _build_rate_limiter(args)
         recorder = RunRecorder()
-        session = HttpClient(_build_session(), rate_limiter=rate_limiter,
+        random.seed(args.seed)
+        scope = Scope(target, args.scope, args.scope_strict)
+        for _u in (args.login_url, getattr(args, 'api_login_url', None)):
+            if _u:
+                scope.add(_u)            # credentials go to the login host the user named
+        session = HttpClient(_build_session(), rate_limiter=rate_limiter, scope=scope,
                              max_requests=args.max_requests, max_bytes=args.max_bytes,
                              verify=True if args.verify_tls else None,
                              log_path=args.request_log)

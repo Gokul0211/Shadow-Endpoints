@@ -16,7 +16,8 @@ RUN cd analysis && npm ci --ignore-scripts --no-audit --no-fund
 COPY analysis/src ./analysis/src
 COPY pyproject.toml ./
 COPY shadow_scanner ./shadow_scanner
-RUN pip install --no-cache-dir ".[excel]"
+# the Excel extra needs Python >= 3.11; this base image has 3.10, so the image has JSON reports only
+RUN pip install --no-cache-dir .
 ENV SHADOW_ANALYSIS_DIR=/app/analysis
 
 WORKDIR /work

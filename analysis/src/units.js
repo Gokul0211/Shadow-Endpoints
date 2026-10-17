@@ -1,6 +1,7 @@
 // Parsing and per-file indexing. One Unit per input file.
 import { parse } from '@babel/parser';
 import _traverse from '@babel/traverse';
+import { deobfuscate } from './deobf.js';
 
 const traverse = _traverse.default ?? _traverse;
 
@@ -64,6 +65,13 @@ export class Unit {
       return false;
     }
     const unit = this;
+    this.deobf = null;
+    try {
+      this.deobf = deobfuscate(this.ast, this.code);
+      if (this.deobf.replaced) traverse.cache.clear();
+    } catch (e) {
+      this.deobf = { error: String(e.message || e).slice(0, 160) };
+    }
     try {
       traverse(this.ast, {
         Program(path) {

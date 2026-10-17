@@ -1,0 +1,12 @@
+analysis/node_modules
+__pycache__
+*.pyc
+output
+results
+tests
+tools
+.git
+.github
+docs
+*.md
+!README.md

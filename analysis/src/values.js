@@ -50,8 +50,9 @@ export function templateKey(t) {
 }
 
 // Text form: holes as {name}; nameless holes as {param}.
+const MANGLED = /^_0x[0-9a-f]{3,}$/; // obfuscator-generated identifier: not a name worth showing
 export function renderTemplate(t) {
-  return t.map((p) => (p.k === 'lit' ? p.s : `{${p.name || 'param'}}`)).join('');
+  return t.map((p) => (p.k === 'lit' ? p.s : `{${p.name && !MANGLED.test(p.name) ? p.name : 'param'}}`)).join('');
 }
 
 export function templateHoles(t) {

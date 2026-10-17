@@ -198,6 +198,10 @@ class EndpointStoreMixin:
         }
         if evidence_extra:
             ev.update(evidence_extra)
+        # Parameters are kept per sighting. A value-flow sink knows its own call's arguments (exact); the
+        # regex extractors guess from a text window that can reach into the neighbouring call (heuristic).
+        ev['params'] = sorted(set(params or []))[:15]
+        ev['params_exact'] = type == 'VALUEFLOW_SINK'
         _x = getattr(self, '_extractor', None)
         if _x:
             self.extractor_stats.setdefault(_x, {'sightings': 0, 'errors': 0})['sightings'] += 1
@@ -357,10 +361,21 @@ class EndpointStoreMixin:
                 e['method'] = m
                 evs = [ev for ev in entry.get('evidence', [])
                        if ev['method'] == m or not ev['method_explicit']]
+                e['parameters'] = self._parameters_for(evs, entry.get('parameters'))
                 e['evidence'] = [{k: ev.get(k) for k in ('type', 'kind', 'source', 'method', 'phase', 'extractor', 'detail')}
                                  for ev in sorted(evs, key=lambda ev: (ev['kind'], ev['type'] or '', ev['source']))][:20]
                 out.append(e)
         return out
+
+    @staticmethod
+    def _parameters_for(evs, fallback):
+        """Parameter names of one (URL, method): exact sink arguments when a value-flow sighting exists
+        (an empty list from it is an answer), otherwise the union of the heuristic guesses."""
+        exact = [ev for ev in evs if ev.get('params_exact')]
+        if exact:
+            return sorted({p for ev in exact for p in ev.get('params') or []})[:15]
+        guessed = sorted({p for ev in evs for p in ev.get('params') or []})[:10]
+        return guessed if evs else list(fallback or [])
 
     def _rebuild_index(self):
         """Re-derive the URL index after self.endpoints was filtered."""

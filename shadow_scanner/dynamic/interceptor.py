@@ -217,11 +217,15 @@ class DynamicInterceptor:
             if self.auth_headers:
                 extra_headers.update(self.auth_headers)
 
+            # Auth headers are NOT set on the whole context (that would send the token to every host the
+            # page loads); _route_guard adds them to first-party requests only, aborts out-of-scope hosts
+            # with --scope-strict and counts browser requests against the request budget.
             context = browser.new_context(
                 ignore_https_errors=True,
                 viewport={'width': 1920, 'height': 1080},
-                extra_http_headers=extra_headers if extra_headers else {}
             )
+            self._auth_extra = extra_headers
+            context.route('**/*', self._route_guard)
 
             # Set cookies
             if self.cookies:
@@ -266,6 +270,9 @@ class DynamicInterceptor:
                         _tok = self.auth_headers['Authorization'].replace('Bearer ', '').strip()
                         _storage_script = """
                         (() => {
+                            const site = '%s';
+                            const host = location.hostname;
+                            if (host !== site && !host.endsWith('.' + site)) return;   // first-party pages only
                             const token = '%s';
                             const keys = ['token', 'authToken', 'accessToken', 'auth_token',
                                           'jwt', 'bearerToken', 'api_token', 'id_token',
@@ -279,7 +286,7 @@ class DynamicInterceptor:
                             window.__AUTH_TOKEN__   = token;
                             window.__BEARER_TOKEN__ = 'Bearer ' + token;
                         })();
-                        """ % _tok.replace("'", "\\'")
+                        """ % (self.domain.split(':')[0].replace("'", ''), _tok.replace("'", "\\'"))
                         try:
                             page.add_init_script(_storage_script)
                         except Exception as _exc:
@@ -385,6 +392,34 @@ class DynamicInterceptor:
 
             print()  # New line after progress
             browser.close()
+
+    def _scope(self):
+        return getattr(getattr(self.analyzer, 'session', None), 'scope', None)
+
+    def _route_guard(self, route, request):
+        """Per-request policy for the browser: scope, budget, credential isolation."""
+        url = request.url
+        try:
+            scope = self._scope()
+            http = getattr(self.analyzer, 'session', None)
+            if scope is not None and not scope.allows(url):
+                scope.blocked += 1
+                route.abort()
+                return
+            if http is not None and hasattr(http, 'note_browser_request') and not http.note_browser_request():
+                route.abort()
+                return
+            headers = dict(request.headers)
+            extra = getattr(self, '_auth_extra', None) or {}
+            if extra and (scope is None or scope.credentials_ok(url)):
+                headers.update(extra)
+            route.continue_(headers=headers)
+        except Exception as _exc:
+            diagnostics.swallowed(__name__, _exc)
+            try:
+                route.continue_()
+            except Exception as _exc2:
+                diagnostics.swallowed(__name__, _exc2)
 
     def _harvest_runtime_api_calls(self, page):
         """Read window.__api_calls (filled by INTERCEPTOR_SCRIPT) into self.endpoints."""

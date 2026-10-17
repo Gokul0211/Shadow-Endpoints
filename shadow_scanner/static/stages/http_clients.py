@@ -1,5 +1,9 @@
 """HTTP-client call patterns (Angular, axios, fetch, Vue/React hooks, SOAP)."""
 import re
+
+_HTTP_VERBS = frozenset({'GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'})
+
+
 class HttpClientPatternsMixin:
     """Endpoints passed to HTTP client APIs (Angular HttpClient, axios, fetch, SOAP...)."""
 
@@ -35,6 +39,8 @@ class HttpClientPatternsMixin:
             injected_var = m.group(1)
             http_method  = m.group(2).upper()
             raw_path     = m.group(3)
+            if http_method == 'REQUEST' and raw_path.upper() in _HTTP_VERBS:
+                continue    # request('OPTIONS', url): the first argument is the method, not the URL
             # Skip if it's actually this.http.X (already handled above)
             if injected_var.lower() in ('http', 'httpclient', 'router', 'route', 'fb', 'formbuilder'):
                 continue
@@ -71,6 +77,8 @@ class HttpClientPatternsMixin:
             var_name    = m.group(1)
             http_method = m.group(2).upper()
             raw_path    = m.group(3)
+            if http_method == 'REQUEST' and raw_path.upper() in _HTTP_VERBS:
+                continue
             # Skip already-handled patterns
             if var_name.lower() in ('this', 'axios', 'http', 'console', 're', 'fs',
                                      'path', 'os', 'url', 'crypto', 'stream', 'buffer'):

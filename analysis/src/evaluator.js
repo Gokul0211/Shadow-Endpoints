@@ -546,8 +546,44 @@ export class Evaluator {
     }
   }
 
+  // `const o = {}; o.k = v; o['k2'] = w;`: the values assigned to the properties of a local object literal,
+  // by property name (flow-insensitive). Obfuscators build their proxy objects this way.
+  objWrites(ref) {
+    const unit = this.unitOf(ref.path);
+    if (!unit._objWrites) {
+      const idx = new Map();
+      unit._objWrites = idx;
+      for (const a of unit.assigns) {
+        if (a.node.operator !== '=') continue;
+        const l = a.get('left');
+        if (!l.isMemberExpression() || !l.get('object').isIdentifier()) continue;
+        const b = a.scope.getBinding(l.node.object.name);
+        if (!b || !b.path.isVariableDeclarator()) continue;
+        const init = b.path.get('init');
+        if (!init.node || !init.isObjectExpression()) continue;
+        let key = null;
+        if (!l.node.computed && l.node.property.type === 'Identifier') key = l.node.property.name;
+        else if (l.node.computed) {
+          try {
+            const kv = this.eval(l.get('property'), this.newCtx());
+            if (kv.t.length === 1 && kv.t[0].length === 1 && kv.t[0][0].k === 'lit') key = kv.t[0][0].s;
+          } catch (e) { key = null; }
+        }
+        if (key === null) continue;
+        const nk = unit.key(init.node);
+        if (!idx.has(nk)) idx.set(nk, new Map());
+        const m = idx.get(nk);
+        if (!m.has(key)) m.set(key, []);
+        m.get(key).push(a.get('right'));
+      }
+    }
+    return unit._objWrites.get(unit.key(ref.path.node)) || null;
+  }
+
   objProp(ref, name, ctx, depth) {
     const out = new AV();
+    const writes = this.objWrites(ref);
+    if (writes && writes.has(name)) for (const rp of writes.get(name).slice(0, MAX_DEFS)) out.merge(this.eval(rp, ctx));
     for (const prop of ref.path.get('properties')) {
       if (prop.isObjectProperty()) {
         const k = prop.node.computed ? null : keyOf(prop.node.key);
@@ -573,6 +609,8 @@ export class Evaluator {
       for (const prop of ref.path.get('properties')) {
         if (prop.isObjectProperty()) out.merge(this.eval(prop.get('value'), ctx));
       }
+      const writes = this.objWrites(ref);
+      if (writes) for (const rps of writes.values()) for (const rp of rps.slice(0, MAX_DEFS)) out.merge(this.eval(rp, ctx));
     } else if (ref.kind === 'arr') {
       for (const el of ref.path.get('elements')) if (el.node) out.merge(this.eval(el, ctx));
     }
@@ -610,6 +648,7 @@ export class Evaluator {
                 if (inner.name === name) {
                   const b = m.scope.getBinding(name);
                   if (b) out.merge(this.evalBinding(b, ctx));
+                  else out.merge(this.paramPropertyAV(m, p, inner, ctx)); // Babel registers no binding for these
                 }
               }
             }
@@ -643,6 +682,27 @@ export class Evaluator {
       const sv = this.eval(cpath.get('superClass'), ctx);
       for (const r of sv.refs) if (r.kind === 'class' && r !== clsRef) out.merge(this.classProp(r, name, ctx, isStatic, depth + 1));
     }
+    return out;
+  }
+
+  // `constructor(private api: Api)`: the property is whatever the annotation names (an injected service or a
+  // native type), or the compiled factory's i-th dependency.
+  paramPropertyAV(ctor, p, inner, ctx) {
+    const out = new AV();
+    const unit = this.unitOf(ctor);
+    out.addTemplate([hole('param', inner.name, { fn: unit.key(ctor.node), idx: p.key })]);
+    const ann = inner.typeAnnotation?.typeAnnotation;
+    if (ann?.type === 'TSTypeReference' && ann.typeName.type === 'Identifier') {
+      const tb = ctor.scope.getBinding(ann.typeName.name);
+      if (tb) {
+        for (const r of this.evalBinding(tb, ctx).refs) {
+          if (r.kind === 'class') out.addRef(this.instRef({ kind: 'class', path: r.path }));
+          else if (r.kind === 'native') out.addRef(r);
+        }
+      } else out.addRef(this.native('type', ann.typeName.name));
+    }
+    const di = this.injectedFor(ctor, p.key, ctx);
+    if (di) out.merge(di);
     return out;
   }
 

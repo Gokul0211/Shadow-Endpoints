@@ -349,6 +349,12 @@ python main.py --target https://example.com --max-routes 10 --max-depth 2 --no-c
 | `--quiet` | false | Hide scan progress output and print only the result paths. Setup prompts and errors are still shown |
 | `--include-inferred` | false | Also report endpoints supported only by inference (e.g. `pages/api` routes guessed from file names) |
 | `--no-probe` | false | Do not request well-known paths nothing references (common API paths, OpenAPI/Actuator/WSDL/Next.js/GraphQL locations, service-worker names, `.d.ts` guesses) |
+| `--scope HOST` | - | Treat HOST (and subdomains) as first-party besides the target's own site; repeatable. Credentials (tokens, cookies, API keys) are sent only to first-party hosts |
+| `--scope-strict` | false | Send no request (HTTP or browser) to hosts outside the scope; without it such requests are made but carry no credentials |
+| `--seed` | 0 | Seed for the scanner's own randomness |
+| `--openapi FILE` | - | Also write the discovered surface as an OpenAPI 3.0 JSON document (scores and evidence kinds as `x-` extensions; nothing invented) |
+| `--postman FILE` | - | Also write a Postman v2.1 collection |
+| `--export-min-score N` | 0 | Leave endpoints scoring below N out of the two exports |
 | `--max-requests` / `--max-bytes` | unlimited | Request / response-byte budget; once used up no further request is sent |
 | `--request-log` | *(none)* | JSON-lines log of every request (method, URL with secret-looking query values masked, status, bytes, seconds, phase). Headers and bodies are never logged |
 | `--verify-tls` | false | Verify TLS certificates (off by default, as in earlier versions) |

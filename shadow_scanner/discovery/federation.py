@@ -192,7 +192,8 @@ class EnhancedFederationHunter:
             _js_attr_re = re.compile(
                 r'''(?:src|href|data-main|data-src|ng-include|ui-sref'''
                 r'''|formaction|dynsrc|action|code|codebase|archive)'''
-                r'''\s*=\s*["']([^"']*?\.js(?:\?[^"']*)?)["']''',
+                # the optional inner quote handles Angular's ng-include="'/x.js'"
+                r'''\s*=\s*["']\s*['"]?([^"']*?\.js(?:\?[^"']*)?)['"]?\s*["']''',
                 re.IGNORECASE
             )
             for m in _js_attr_re.finditer(r.text):

@@ -21,7 +21,7 @@
 // sites (in any file) are analysed with the arguments substituted.
 import { AV, hole, renderTemplate, substitute, templateHoles } from './values.js';
 import { graphqlOperations } from './graphql.js';
-import { requestInfo } from './request_info.js';
+import { cleanKeys, configKeys, keysOf, paramFlows, requestInfo } from './request_info.js';
 import { rtkEndpoints } from './rtk.js';
 import { nextRoutes } from './nextroutes.js';
 
@@ -93,10 +93,34 @@ export class Sinks {
   }
 
   // ---- classification -----------------------------------------------------
-  classify(call, ctx) {
+  // A forwarding proxy `function (f, a, b) { return f(a, b); }` (control-flow obfuscators route calls through
+  // such helpers): the call is the call of its first argument with the remaining ones.
+  proxyCall(call, ctx) {
+    if (call.node.type === 'NewExpression') return null;
+    let v;
+    try { v = this.ev.eval(call.get('callee'), ctx); } catch (e) { return null; }
+    const fns = v.refs.filter((r) => r.kind === 'fn');
+    if (fns.length !== 1) return null;
+    const node = fns[0].path.node;
+    if (!node.params.length || node.params.some((p) => p.type !== 'Identifier')) return null;
+    const body = node.body;
+    const ret = body.type === 'BlockStatement'
+      ? (body.body.length === 1 && body.body[0].type === 'ReturnStatement' ? body.body[0].argument : null)
+      : body;
+    if (!ret || ret.type !== 'CallExpression' || ret.callee.type !== 'Identifier') return null;
+    const k = node.params.findIndex((p) => p.name === ret.callee.name);
+    if (k < 0) return null;
+    const rest = node.params.filter((_, i) => i !== k).map((p) => p.name);
+    if (ret.arguments.length !== rest.length || ret.arguments.some((a, i) => a.type !== 'Identifier' || a.name !== rest[i])) return null;
+    const callArgs = call.get('arguments');
+    if (callArgs.length <= k) return null;
+    return { callee: callArgs[k], args: callArgs.filter((_, i) => i !== k) };
+  }
+
+  classify(call, ctx, override) {
     const n = call.node;
-    const callee = call.get('callee');
-    const args = call.get('arguments');
+    const callee = override ? override.callee : call.get('callee');
+    const args = override ? override.args : call.get('arguments');
     const ev = this.ev;
     if (n.type === 'NewExpression') {
       if (callee.isIdentifier() && !callee.scope.getBinding(callee.node.name)) {
@@ -275,6 +299,10 @@ export class Sinks {
         const ctx = this.ev.newCtx();
         try {
           sink = this.classify(call, ctx);
+          if (!sink) {
+            const px = this.proxyCall(call, ctx);
+            if (px) { sink = this.classify(call, ctx, px); if (sink) sink.args = px.args; }
+          }
           if (!sink) continue;
           const uv = this.urlOf(sink, ctx);
           if (!uv) continue;
@@ -354,12 +382,35 @@ export class Sinks {
         this.stats.derived++;
         const name = [...this.fnNames(fnPath)][0] || '(anonymous)';
         queue.push({
-          unit: site.unit, call: site.call, sink, urlAV: urls, methodAV, info: item.info,
+          unit: site.unit, call: site.call, sink, urlAV: urls, methodAV, info: this.carryInfo(item.info, fnKey, site),
           via: [...item.via, { fn: name, file: site.unit.id, ...site.unit.loc(site.call.node) }],
           depth: item.depth + 1,
         });
       }
     }
+  }
+
+  // The request info of a wrapper's sink, completed with what this call site passes for the parameters that
+  // flow into the body / query / config (the wrapper itself cannot know them).
+  carryInfo(info, fnKey, site) {
+    const mine = (info.flows || []).filter((f) => f.fn === fnKey);
+    if (!mine.length) return info;
+    const params = new Set(info.params);
+    const flows = (info.flows || []).filter((f) => f.fn !== fnKey);
+    const callArgs = site.call.get('arguments');
+    for (const f of mine) {
+      const argPath = callArgs[f.idx];
+      if (!argPath || argPath.isSpreadElement()) continue;
+      const ctx = this.ev.newCtx();
+      try {
+        const keys = f.mode === 'cfg' ? configKeys(this.ev, argPath, ctx) : keysOf(this.ev, argPath, ctx);
+        for (const k of keys) params.add(k);
+        for (const nf of paramFlows(this.ev, argPath, ctx, f.mode)) {
+          if (!flows.some((x) => x.fn === nf.fn && x.idx === nf.idx && x.mode === nf.mode)) flows.push(nf);
+        }
+      } catch (e) { this.stats.infoErrors = (this.stats.infoErrors || 0) + 1; }
+    }
+    return { params: cleanKeys(params), auth: info.auth, flows };
   }
 
   // Which argument values are substituted into a wrapper's URL template? Values

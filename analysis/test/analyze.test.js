@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import { analyze } from '../src/cli.js';
+import { Unit } from '../src/units.js';
 
 const run = (files) => analyze({ files: files.map(([id, code]) => ({ id, code })) });
 const out = (r) => r.findings.map((f) => `${f.method ?? '?'} ${f.base ? f.base : ''}${f.url}`).sort();
@@ -266,6 +268,64 @@ test('request parameters and authorisation header are read off the sink', () => 
   assert.deepEqual(by('/api/search').params, ['page', 'q']);
   assert.deepEqual(by('/api/items').params, ['limit', 'sort']);
   assert.equal(by('/api/items').auth, false);
+});
+
+test('a request helper takes its parameters from the call sites (query object, body type, config)', () => {
+  const r = run([['svc.ts', `
+    import { HttpClient, HttpParams } from '@angular/common/http';
+    interface CreatePermitRequest { siteId: string; startDate: string; level: number }
+    export class Api {
+      constructor(private http: HttpClient) {}
+      get(name: string, params?: HttpParams) { return this.http.get('/api/rpc/' + name, { params }); }
+      post(name: string, body: any) { return this.http.post('/api/rpc/' + name, body); }
+      call(name: string, cfg: any) { return this.http.get('/api/rpc/' + name, cfg); }
+    }
+    export class Permits {
+      constructor(private api: Api) {}
+      one(id: string) { const params = new HttpParams().set('workOrderId', id); return this.api.get('getWorkOrder', params); }
+      create(request: CreatePermitRequest) { return this.api.post('createPermit', request); }
+      login() { return this.api.post('login', { username: u, password: p }); }
+      list() { return this.api.call('listPermits', { params: { status: 'open', page: 1 } }); }
+      none() { return this.api.get('getTypes'); }
+    }`]]);
+  const by = (u) => r.findings.find((f) => f.url === u);
+  assert.deepEqual(by('/api/rpc/getWorkOrder').params, ['workOrderId']);
+  assert.deepEqual(by('/api/rpc/createPermit').params, ['level', 'siteId', 'startDate']);
+  assert.deepEqual(by('/api/rpc/login').params, ['password', 'username']);
+  assert.deepEqual(by('/api/rpc/listPermits').params, ['page', 'status']);
+  assert.deepEqual(by('/api/rpc/getTypes').params, []);
+});
+
+// javascript-obfuscator output (fixtures generated with version 5.9.0 from test/fixtures/source.js):
+// string array + rotation + decoder (none / base64 / rc4), wrappers (function / variable, chained), control-flow
+// proxies, split strings, numbers as expressions
+for (const name of ['obf_low', 'obf_medium', 'obf_high', 'obf_base64_chained', 'obf_rc4_variable']) {
+  test(`string-array obfuscation is undone: ${name}`, () => {
+    const code = fs.readFileSync(new URL(`./fixtures/${name}.js`, import.meta.url), 'utf8');
+    const u = new Unit(`${name}.js`, code);
+    assert.ok(u.parse());
+    assert.ok(u.deobf.replaced > 0 && u.deobf.unrotated === 0, JSON.stringify(u.deobf));
+    const r = run([[`${name}.js`, code]]);
+    has(r, 'GET http://localhost:4001/api/users');
+    has(r, 'DELETE http://localhost:4001/api/users/{param}');
+  });
+}
+
+test('a file that only looks like it has a string array is left alone', () => {
+  const u = new Unit('x.js', "var a = ['a','b','c']; a['push'](a['shift']()); fetch('/api/x');");
+  assert.ok(u.parse());
+  assert.equal(u.deobf.replaced, 0);
+});
+
+test('local object with properties assigned one by one', () => {
+  const r = run([['o.js', "const urls = {}; urls.users = '/api/users'; urls['items'] = '/api/' + 'items'; fetch(urls.users); fetch(urls.items);"]]);
+  has(r, 'GET /api/users');
+  has(r, 'GET /api/items');
+});
+
+test('a forwarding proxy is looked through', () => {
+  const r = run([['p.js', "const call = function (f, a, b) { return f(a, b); }; call(fetch, '/api/proxied', { method: 'PUT' });"]]);
+  has(r, 'PUT /api/proxied');
 });
 
 test('a very deep concatenation chain does not overflow the stack', () => {

@@ -18,7 +18,7 @@ dependencies = [
 
 [project.optional-dependencies]
 browser = ["playwright==1.60.0"]       # dynamic phase (also: python -m playwright install chromium)
-excel = ["pandas==3.0.2"]
+excel = ["pandas==3.0.2; python_version >= '3.11'"]
 
 [project.scripts]
 shadow-scanner = "shadow_scanner.cli:main"

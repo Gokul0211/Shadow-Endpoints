@@ -24,6 +24,7 @@ import requests
 
 from shadow_scanner.config import logger
 from shadow_scanner.core.rate_limiter import RateLimiter
+from shadow_scanner.core.scope import OutOfScope, Scope
 
 _SECRET_QUERY = re.compile(r'pass|secret|token|key|auth|sig|session|code', re.I)
 
@@ -47,7 +48,7 @@ def mask_url(url):
 
 class HttpClient:
     def __init__(self, session, rate_limiter=None, max_requests=None, max_bytes=None,
-                 verify=None, retries=2, log_path=None):
+                 verify=None, retries=2, log_path=None, scope=None):
         self._session = session
         self.rate_limiter = rate_limiter or RateLimiter()
         self.max_requests = max_requests
@@ -55,6 +56,7 @@ class HttpClient:
         self.verify = verify            # None = leave each call's own setting
         self.retries = retries
         self.phase = '-'
+        self.scope = scope              # core.scope.Scope: credential isolation / --scope-strict
         self._lock = threading.Lock()
         self._requests = 0
         self._bytes = 0
@@ -109,16 +111,32 @@ class HttpClient:
                 self._log.flush()
 
     # -- requests ------------------------------------------------------------
+    def _send(self, method, url, kwargs):
+        """One attempt. Credentials go only to first-party hosts: for any other host the request is made
+        without the session's Authorization/Cookie headers and without its cookie jar."""
+        sc = self.scope
+        if sc is not None and not sc.credentials_ok(url) and isinstance(self._session, requests.Session):
+            sc.credentials_withheld += 1
+            headers = sc.safe_headers(dict(self._session.headers))
+            headers.update(sc.safe_headers(kwargs.pop('headers', None)))
+            return requests.request(method, url, headers=headers, **kwargs)
+        return getattr(self._session, method.lower())(url, **kwargs)
+
     def request(self, method, url, **kwargs):
         if self.verify is not None:
             kwargs['verify'] = self.verify
+        if self.scope is not None and not self.scope.allows(url):
+            self.scope.blocked += 1
+            with self._lock:
+                self._by_phase.setdefault(self.phase, {'requests': 0, 'bytes': 0, 'errors': 0})
+            raise OutOfScope(f'{url} is outside the declared scope (--scope-strict)')
         ph = self._charge()
         last_exc = None
         for attempt in range(self.retries + 1):
             self.rate_limiter.wait()
             t0 = time.time()
             try:
-                resp = getattr(self._session, method.lower())(url, **kwargs)
+                resp = self._send(method, url, kwargs)
             except BudgetExceeded:
                 raise
             except Exception as exc:
@@ -146,6 +164,18 @@ class HttpClient:
     def head(self, url, **kwargs):
         return self.request('HEAD', url, **kwargs)
 
+    def note_browser_request(self):
+        """Count one request made by the browser against the same budget; False once it is used up."""
+        prev = self.phase
+        self.phase = 'browser'
+        try:
+            self._charge()
+            return True
+        except BudgetExceeded:
+            return False
+        finally:
+            self.phase = prev
+
     # -- reporting -----------------------------------------------------------
     def stats(self):
         with self._lock:
@@ -157,6 +187,7 @@ class HttpClient:
                 'by_phase': {k: dict(v) for k, v in sorted(self._by_phase.items())},
                 'budget': {'max_requests': self.max_requests, 'max_bytes': self.max_bytes,
                            'exhausted': self._budget_hit},
+                'scope': self.scope.summary() if self.scope is not None else None,
             }
 
     def close(self):

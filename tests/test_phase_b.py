@@ -216,6 +216,10 @@ class ExtractorSnippets(unittest.TestCase):
         self.assertIn(('POST', '/api/users'), got)
         self.assertTrue(any(m == 'DELETE' and p.startswith('/api/users') for m, p in got))
 
+    def test_request_method_argument_is_not_a_url(self):
+        got = self.endpoints('this.http.request("OPTIONS", this.base + "audit/capabilities");')
+        self.assertFalse(any(p.endswith('/OPTIONS') for _, p in got))
+
     def test_fetch_method_option(self):
         self.assertIn(('PUT', '/api/items'), self.endpoints('fetch("/api/items", {method: "PUT"});'))
 

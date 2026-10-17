@@ -24,6 +24,7 @@ its observed requests to it too. `static_endpoints` below is the same list
 object, kept only as a name for readability - nothing copies or extends it.
 Each phase sets analyzer.current_phase, which is stored on every evidence item.
 """
+import json
 import os
 import re
 import shutil
@@ -523,6 +524,17 @@ def _write_report(args, static_endpoints, dynamic_endpoints, found_maps, interce
         os.makedirs(_copy_dir, exist_ok=True)
         shutil.copyfile(_json_out, args.output)
         print(f"[RESULTS] Copy  → {os.path.abspath(args.output)}")
+    if getattr(args, 'openapi', None) or getattr(args, 'postman', None):
+        from shadow_scanner.reporting import exporters
+        with open(_json_out, encoding='utf-8') as _f:
+            _rep = json.load(_f)
+        _min = getattr(args, 'export_min_score', 0)
+        for _path, _fn, _label in ((args.openapi, exporters.to_openapi, 'OpenAPI'),
+                                   (args.postman, exporters.to_postman, 'Postman')):
+            if _path:
+                os.makedirs(os.path.dirname(os.path.abspath(_path)), exist_ok=True)
+                exporters.write_json(_fn(_rep, _min), _path)
+                print(f"[RESULTS] {_label:<7} → {os.path.abspath(_path)}")
     if _excel_out and os.path.exists(_excel_out):
         print(f"[RESULTS] Excel → {os.path.abspath(_excel_out)}")
     _res_root = os.path.abspath(os.path.join("output", domain_slug))
