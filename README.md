@@ -23,7 +23,7 @@ Evaluation results are being re-measured on SPABench v3.0.0 with the benchmark-s
 - **Recursive lazy-loading feedback loop**: JS files discovered dynamically are fed back into the static phase, catching endpoints in chunks Phase 1 couldn't predict
 - **GraphQL introspection**: enumerates all queries, mutations and subscriptions, plus APQ (Automatic Persisted Query) detection
 - **WebSocket discovery**: static extraction, plus runtime monkey-patching of the native `WebSocket` constructor
-- **Bayesian confidence scoring**: 47 likelihood-ratio signals combined into a continuous posterior score (0–100), calibratable against labeled ground truth via MLE
+- **Bayesian confidence scoring**: 49 hand-set likelihood-ratio signals combined into a continuous score (0–100), plus the evidence the score rests on; learned weights are the next step (see `vibe/scanner-plan.md`, Phase E)
 - **Security-relevant header mining**: client-set secrets (API keys, hard-coded bearer tokens) and server-read trust headers (`X-Internal-IP`, `X-User-Role`, `X-Tenant-Id`…), from JS, recovered source and live browser traffic
 - **De-obfuscation pre-pass**: `atob()`, `String.fromCharCode()`, hex escapes, `unescape()`, reversed strings and `eval(decoder(...))` wrappers are decoded before extraction
 - **Authentication automation**: form login, Playwright browser login, built-in TOTP MFA, Bearer token injection
@@ -113,6 +113,25 @@ The core static layer, running on all bundles including those discovered in Phas
 
 There are 72 catalogued headers, and severity escalates for server-read trust headers and hard-coded secret values.
 
+### Phase 2.5: URL value-flow analysis
+
+Runs after every bundle, sub-app and source map has been fetched (and once more if the browser phase brought new code).
+All client code the scan has seen (bundles and the TypeScript/JSX sources embedded in source maps) is handed to a
+Babel-based Node.js sidecar (`analysis/`, see `analysis/src/*.js`). It parses every file (TypeScript, JSX, modern syntax),
+builds the module graph (ES imports, CommonJS `require`, webpack module tables) and evaluates the URL that reaches each
+**HTTP sink** as a set of *templates*: literal text plus typed holes (`param`, `unknown`, `origin`, `env`, `runtime`).
+Config objects, class fields, getters, `this.x`, services injected by TypeScript type, function calls and
+`axios.create({baseURL})` instances are followed across modules. A function whose parameter reaches a sink is detected as a
+wrapper automatically and its call sites (in any file) are analysed with the arguments substituted; data arguments stay
+`{param}` (so `/api/users/{id}`, not `/api/users/5`). The method comes from the sink (`axios.post`, `fetch(url, {method})`,
+`xhr.open`), not from nearby text.
+
+Sinks: `fetch`/`Request`, `XMLHttpRequest.open`, `WebSocket`, `EventSource`, `sendBeacon`, imported HTTP libraries and their
+`.get/.post/...` calls, `HttpClient`-typed receivers, `$http`/jQuery, and (URL-shaped first argument only) unknown receivers.
+GraphQL resolver maps, decorators and SDL are recognised as operations. Each finding is evidence of type `VALUEFLOW_SINK`
+with the sink kind, wrapper chain and hole classes under `evidence[].detail`. `--disable-extractor value_flow` or
+`--disable-phase 2.5` switches it off.
+
 ### Phase 1.75: Service Workers
 *`discovery/service_worker.py` → `ServiceWorkerAnalyzer`*
 
@@ -158,16 +177,16 @@ Every candidate passes through `BayesianConfidenceScorer.score()`:
 P(API | signals) = [ P(API) × ∏ LRᵢ ] / [ P(API) × ∏ LRᵢ + (1 − P(API)) ]
 ```
 
-The prior is `P(API) = 0.35`. There are 47 signals, each with a likelihood ratio, and 71 extraction types mapped to them. The score maps to a tier:
+The prior is `P(API) = 0.35`. There are 49 signals, each with a (hand-set, provisional) likelihood ratio, and 79 extraction types mapped to them. The score maps to a tier:
 
 | Score | Tier | Use case |
 |-------|------|---------|
-| ≥ 85 | `VERIFIED_API` | CI/CD pipeline integration, near-zero false positives |
+| ≥ 85 | `HIGH_CONFIDENCE` | Strong static or spec evidence (not observed at runtime) |
 | 55–84 | `BACKEND_API` | Penetration testing: verified list, minimal triage |
 | 30–54 | `LOW_CONFIDENCE` | Bug bounty: maximum reach, includes partial paths |
 | < 30 | `NOISE_CANDIDATE` | Filtered from output |
 
-`verified_dynamic` (seen directly in live browser traffic) is hard-scored to 100. Vendor source paths get an LR penalty of 0.2 before scoring. **EndpointProvenanceGraph** (`core/provenance.py`) adds up to +30 when independent categories (RUNTIME, SCHEMA, CONFIG, SOURCEMAP, STATIC, STORAGE) confirm the same URL.
+`VERIFIED_API` is reserved for requests **observed in browser traffic** (runtime evidence): such an endpoint is scored 100. Nothing else may carry that label; spec-declared routes (OpenAPI, Actuator, WSDL, Next.js manifest, GraphQL introspection) are a separate evidence kind. Vendor source paths get an LR penalty of 0.2 before scoring. **EndpointProvenanceGraph** (`core/provenance.py`) adds up to +30 when independent categories (RUNTIME, SCHEMA, CONFIG, SOURCEMAP, STATIC, STORAGE, PROBE) confirm the same URL; endpoints supported only by inference (INFERRED, e.g. a `pages/api/<file>` route guessed from a file name) are left out of the report unless `--include-inferred` is given.
 
 The scorer also implements `calibrate_from_labels()`: MLE-based LR calibration from labeled ground truth, with Laplace smoothing (Jeffreys prior α = 0.5). It computes Wilson 95% CIs for per-tier precision reporting.
 
@@ -189,8 +208,19 @@ The scorer also implements `calibrate_from_labels()`: MLE-based LR calibration f
 ### Install core dependencies
 
 ```bash
-pip install requests beautifulsoup4 urllib3 esprima pandas openpyxl
+pip install -e .            # exact versions are pinned in pyproject.toml
+# or: pip install requests beautifulsoup4 urllib3 esprima openpyxl
 ```
+
+### Install the value-flow sidecar (recommended)
+
+The URL value-flow analysis runs in a small Node.js program (`analysis/`, Babel parser). It needs Node 20.19+ and one command; without it the scanner still runs, the `value_flow` extractor just logs a warning and does nothing.
+
+```bash
+cd analysis && npm ci --ignore-scripts
+```
+
+`SHADOW_ANALYSIS_DIR` points the scanner at a different location of that folder.
 
 ### Install Playwright (required for Phase 3 dynamic analysis)
 
@@ -317,6 +347,26 @@ python main.py --target https://example.com --max-routes 10 --max-depth 2 --no-c
 | `--api-login-url` | *(none)* | Direct API POST endpoint, for when `--login-url` is a SPA front-end route that returns 405 on POST |
 | `--verbose` / `-v` | false | Enable debug logging (cache hits, rate-limit events, suppressed errors) |
 | `--quiet` | false | Hide scan progress output and print only the result paths. Setup prompts and errors are still shown |
+| `--include-inferred` | false | Also report endpoints supported only by inference (e.g. `pages/api` routes guessed from file names) |
+| `--no-probe` | false | Do not request well-known paths nothing references (common API paths, OpenAPI/Actuator/WSDL/Next.js/GraphQL locations, service-worker names, `.d.ts` guesses) |
+| `--max-requests` / `--max-bytes` | unlimited | Request / response-byte budget; once used up no further request is sent |
+| `--request-log` | *(none)* | JSON-lines log of every request (method, URL with secret-looking query values masked, status, bytes, seconds, phase). Headers and bodies are never logged |
+| `--verify-tls` | false | Verify TLS certificates (off by default, as in earlier versions) |
+| `--disable-phase` | *(none)* | Skip a pipeline phase (repeatable): `1.5 2 1.55 1.6 1.75 1.8 1.85 3 1.5b`. Phase 1 always runs |
+| `--disable-extractor` / `--only-extractor` | *(none)* | Switch extractors off / run only the named ones (repeatable), for ablations. `--list-extractors` prints the names |
+
+**Credentials.** `--password`, `--bearer`, `--cookies` and `--mfa-secret` can be supplied through the environment
+instead (`SHADOW_PASSWORD`, `SHADOW_BEARER`, `SHADOW_COOKIES`, `SHADOW_MFA_SECRET`) so they stay out of shell history.
+They are never written to the report: the `run.args` block shows them as `<redacted>`.
+
+**Run metadata.** Every report has a `run` block: scanner git SHA and dirty flag, Python and package versions, a hash
+of the result-relevant configuration, arguments (secrets redacted), wall time and request counts per phase, HTTP
+totals, per-extractor sightings and error counts, and `swallowed_errors` (errors the scanner survived, by module).
+
+**Tests and offline benchmark.** `python -m unittest discover -s tests` runs the unit tests and the offline SPABench
+regression tests (needs the SPABench checkout next to this repository, or `SPABENCH_DIR`; they are skipped otherwise).
+`python tools/offline_bench.py [--disable-extractor NAME ...]` runs the static phase on SPABench's own files with no
+network and scores it with `evaluate.py`.
 
 ---
 
@@ -457,6 +507,8 @@ Tokens are harvested automatically from login responses, `localStorage`/`session
 
 ## Performance
 
+*These timings come from earlier measurements on production targets and are not regenerated by a script; treat them as indicative. Per-phase wall time and request counts of every scan are now recorded in the report's `run` block.*
+
 Benchmarked on MacBook Pro M2, 16 GB RAM, 100 Mbps connection:
 
 | Target | Total Time | Phase 3 Time | Notes |
@@ -480,6 +532,10 @@ refactored/
 ├── main.py                       entry point: python main.py --target ...
 ├── README.md                     this file
 ├── REFACTOR_NOTES.md             what changed vs the single-file version
+├── pyproject.toml  Dockerfile    packaging (pinned versions), image with Node + Playwright
+├── analysis/                     Node.js value-flow sidecar (Babel): src/*.js, test/*.test.js
+├── tools/offline_bench.py        static phase vs SPABench's own files, no network/Docker
+├── tests/                        Python unit + offline-benchmark regression tests
 └── shadow_scanner/
     ├── __main__.py               python -m shadow_scanner
     ├── cli.py                    argument parsing, connectivity check, session, auth, main()
@@ -604,11 +660,11 @@ Benchmark test-case IDs (`EP-…`, `TC-…`) were removed from the comments toge
 
 **Heavy obfuscation:** Standard minification and variable renaming are fully handled. Build-time encrypted configurations, WebAssembly-based routing paths, and control-flow flattening with rotation-shifted string arrays need deobfuscation beyond the current Phase 2 scope.
 
-**Source map dependency:** Phase 1.5 contributes 35–44% of exclusive findings when source maps are available. Targets that restrict `.map` access will get less coverage from this phase; every other phase runs normally.
+**Source map dependency:** when source maps are exposed, the original TypeScript/JSX sources become analysable (this is where the value-flow analysis gains most). Targets that restrict `.map` access get less coverage from this phase; every other phase runs normally.
 
-**Framework coverage:** Svelte, SvelteKit, Remix and Astro have not yet been validated against ground-truth data. Angular, React, Vue and Next.js are fully validated.
+**Framework coverage:** results exist only for SPABench v3 (Angular, React, Vue, Next.js), which is a *development* set for this scanner. Svelte, SvelteKit, Remix and Astro have not been evaluated; held-out evaluation is planned (`vibe/remaining-work.md`).
 
-**Production false positive estimate:** The reported `<1%` FP rate comes from stratified 50-endpoint spot checks per target. The Wilson 95% upper bound on this estimate is 5.8%.
+**No production false-positive rate is claimed.** Earlier versions of this document quoted a `<1%` rate from 50-endpoint spot checks; the interval was miscomputed (the 95% Wilson upper bound for 0/50 is 7.1%, not 5.8%) and the targets were also used while developing the scanner, so the figure is withdrawn. Evaluation is on SPABench and on held-out applications with ground truth.
 
 ### Fixed bugs
 

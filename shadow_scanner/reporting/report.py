@@ -9,6 +9,7 @@ from collections import defaultdict
 from shadow_scanner.config import PLAYWRIGHT_AVAILABLE, is_ignored_url
 from shadow_scanner.core.scoring import BayesianConfidenceScorer
 from shadow_scanner.reporting.excel import json_to_excel
+from shadow_scanner.core import diagnostics
 
 
 def _extract_security_findings(results: list) -> list:
@@ -152,8 +153,8 @@ def _filter_endpoints(entries):
 
             if ext in _STATIC_EXTENSIONS and not exempt_js and not _is_websocket:
                 continue
-        except Exception:
-            pass
+        except Exception as _exc:
+            diagnostics.swallowed(__name__, _exc)
 
         # 4. AST garbage patterns (bare //, /../0 etc.)
         if ep_url in ('//', '/../0', '/./', '/../') or (
@@ -185,8 +186,8 @@ def _filter_endpoints(entries):
             ):
                 if 'frontend_route_nav' in tags or conf_score < 50:
                     continue
-        except Exception:
-            pass
+        except Exception as _exc:
+            diagnostics.swallowed(__name__, _exc)
 
         # 9. Pure SPA router paths emitted from ROUTER_NAV
         # as BACKEND_API with no dynamic evidence and no API path indicator.
@@ -507,6 +508,8 @@ def save_report(static, dynamic, filename="results.json", source_maps=None, inte
                            base_security_findings, security_headers, ext_links,
                            sourcemap_engine, backend_findings)
 
+    if analyzer is not None and getattr(analyzer, 'run_meta', None):
+        report['run'] = analyzer.run_meta
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2)
 

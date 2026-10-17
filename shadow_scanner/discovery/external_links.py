@@ -51,7 +51,7 @@ class ExternalLinkExtractor:
     def __init__(self, target_url: str):
         parsed       = urllib.parse.urlparse(target_url)
         self.target_host = parsed.netloc.lower()
-        # Extract root domain (last two parts): rcow.ril.com -> ril.com
+        # Extract root domain (last two parts): app.example.com -> example.com
         parts = self.target_host.split('.')
         self.root_domain = '.'.join(parts[-2:]) if len(parts) >= 2 else self.target_host
 

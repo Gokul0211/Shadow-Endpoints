@@ -1,3 +1,4 @@
+from shadow_scanner.core import diagnostics
 """Generic depth-first walker over esprima AST nodes."""
 def walk(node, visitor):
     """Depth-first AST walk. Calls visitor(node) for every node."""
@@ -7,8 +8,8 @@ def walk(node, visitor):
         return
     try:
         visitor(node)
-    except Exception:
-        pass
+    except Exception as _exc:
+        diagnostics.swallowed(__name__, _exc)
     for key in vars(node):
         child = getattr(node, key, None)
         if child is None:

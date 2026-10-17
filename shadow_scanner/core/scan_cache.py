@@ -6,6 +6,7 @@ import threading
 import time
 
 from shadow_scanner.config import logger
+from shadow_scanner.core import diagnostics
 class ScanCache:
     """
     File-backed key-value cache for JS file content.
@@ -101,8 +102,8 @@ class ScanCache:
                         # so the file will be re-fetched but metadata is preserved.
                         entry.setdefault('content', None)
                         self._store[key] = entry
-                    except Exception:
-                        pass
+                    except Exception as _exc:
+                        diagnostics.swallowed(__name__, _exc)
             hits = sum(1 for e in self._store.values() if e.get('content'))
             logger.debug(f"[Cache] Loaded {len(self._store)} entries from {self.path} ({hits} with content)")
         except Exception as exc:

@@ -42,7 +42,12 @@ STORAGE_TYPES = frozenset({
     'INDEXEDDB_CACHED_URL',
 })
 
-KINDS = ('runtime', 'spec', 'probe', 'storage', 'static')
+# Guessed from a file name or convention, not referenced by any code (reported only with --include-inferred).
+INFERRED_TYPES = frozenset({
+    'NEXTJS_FILE_ROUTE',          # pages/api/<file>.ts -> /api/<file>
+})
+
+KINDS = ('runtime', 'spec', 'probe', 'storage', 'inferred', 'static')
 
 
 def evidence_kind(extraction_type):
@@ -56,6 +61,8 @@ def evidence_kind(extraction_type):
         return 'probe'
     if t in STORAGE_TYPES:
         return 'storage'
+    if t in INFERRED_TYPES:
+        return 'inferred'
     return 'static'
 
 

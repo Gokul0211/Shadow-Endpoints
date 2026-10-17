@@ -30,6 +30,7 @@ import shutil
 import time
 import urllib.parse
 
+from shadow_scanner import config
 from shadow_scanner.config import PLAYWRIGHT_AVAILABLE
 from shadow_scanner.discovery.backend_intel import BackendFileHunter
 from shadow_scanner.discovery.chunks import WebpackChunkHarvester, _discover_nextjs_chunks
@@ -44,6 +45,7 @@ from shadow_scanner.discovery.subapps import (
 from shadow_scanner.dynamic.interceptor import DynamicInterceptor
 from shadow_scanner.reporting.report import save_report
 from shadow_scanner.static.analyzer import EnhancedStaticAnalyzer
+from shadow_scanner.core import diagnostics
 
 
 def phase1_discovery(session, target):
@@ -366,10 +368,10 @@ def phase1_85_external_js(session, target, analyzer, js_files, ext_links, static
                         js_files.append(_mjs_url)
                         _recursive_main_js_urls.add(_mjs_url)
                         print(f"    \u2713 {_mjs_url.split('/')[-1]} from {_ext_url.split('/')[-2]}/ ({len(_mcode):,} bytes)")
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+                    except Exception as _exc:
+                        diagnostics.swallowed(__name__, _exc)
+            except Exception as _exc:
+                diagnostics.swallowed(__name__, _exc)
         _new_ext = len(analyzer.endpoints) - _snap_ext
         if _new_ext:
             print(f"[PHASE 1.85] +{_new_ext} endpoint(s) from external JS bundles")
@@ -393,6 +395,12 @@ def phase1_85_external_js(session, target, analyzer, js_files, ext_links, static
             if _recur_maps:
                 found_maps = sorted(set(found_maps or []) | set(_recur_maps))
     return found_maps
+
+
+def phase2_5_value_flow(analyzer):
+    """Phase 2.5: URL value-flow analysis over everything fetched so far (bundles + source-map sources)."""
+    analyzer.current_phase = '2.5'
+    analyzer.run_extractor('value_flow', analyzer.run_value_flow)
 
 
 def phase3_dynamic(target, analyzer, cookies, args, auth_headers, ext_links, static_endpoints):
@@ -445,11 +453,11 @@ def _promote_external_links(session, json_files, ext_links, analyzer):
                     ext_links.feed_json(r.json(), source=jf)
                 except Exception:
                     ext_links.feed_js(r.text, source=jf)
-        except Exception:
-            pass
+        except Exception as _exc:
+            diagnostics.swallowed(__name__, _exc)
 
     # RC5-FIX: Promote INTERNAL_SUBDOMAIN and SSO_AUTH entries from ExternalLinkExtractor
-    # into the main endpoint pool. These are same-org subdomains (e.g. rcowgis.ril.com)
+    # into the main endpoint pool. These are same-org subdomains (e.g. gis.example.com)
     # carrying real API paths. Previously they were classified correctly but silently
     # dropped from the endpoint pool — only appearing in the external_links report section.
     analyzer.current_phase = '4-links'
@@ -490,6 +498,13 @@ def _write_report(args, static_endpoints, dynamic_endpoints, found_maps, interce
                   ext_links, backend_findings, target, analyzer, domain_slug):
     """Phase 4/5: JSON + Excel report and the output-location banner."""
     output_file = args.output or 'results.json'   # only used by save_report as a naming fallback
+    recorder = getattr(args, '_recorder', None)
+    if recorder is not None:
+        from shadow_scanner import config as _cfg
+        analyzer.run_meta = recorder.build(args, _cfg)   # secrets are redacted there
+        analyzer.run_meta['extractors'] = dict(sorted(analyzer.extractor_stats.items()))
+        analyzer.run_meta['value_flow'] = analyzer.value_flow_stats
+        analyzer.run_meta['swallowed_errors'] = diagnostics.summary()   # survived errors, by module
 
     save_report(analyzer.endpoints, dynamic_endpoints, output_file,
                 source_maps=found_maps, interceptor=interceptor,
@@ -545,6 +560,11 @@ def run_scan(args, target, session, cookies, auth_headers, rate_limiter, scan_ca
     print("STARTING ENHANCED SCAN")
     print("="*70)
 
+    recorder = getattr(args, '_recorder', None)
+    if recorder is not None:
+        recorder.start_phase('1')
+    if hasattr(session, 'set_phase'):
+        session.set_phase('1')
     ext_links, hunter, js_files, json_files = phase1_discovery(session, target)
     domain_slug, sourcemap_dir, backend_dir = prepare_output_dirs(target)
 
@@ -555,25 +575,46 @@ def run_scan(args, target, session, cookies, auth_headers, rate_limiter, scan_ca
                                       scan_cache=scan_cache,
                                       workers=args.workers,
                                       fetch_timeout=args.timeout)
+    analyzer.recorder = recorder
     # Relative references resolve against the page's <base href>, like a browser
     _base_m = re.search(r'<base\s[^>]*href=["\']([^"\']+)["\']', hunter.raw_html or '', re.I)
     if _base_m:
         analyzer.normalizer.set_base_href(_base_m.group(1))
 
-    js_files, found_maps = phase1_5_sourcemaps(session, target, js_files, analyzer, sourcemap_dir)
-    static_endpoints = phase2_static_analysis(analyzer, js_files, json_files)
-    js_files, found_maps = phase1_55_subapp_index_pages(
-        session, target, analyzer, js_files, static_endpoints, found_maps, sourcemap_dir)
-    js_files, found_maps = phase1_6_bundle_discovery(
-        session, target, analyzer, js_files, static_endpoints, found_maps, sourcemap_dir)
-    phase1_75_service_workers(session, target, hunter, analyzer)
-    backend_findings = phase1_8_backend_intel(session, target, backend_dir, analyzer)
-    found_maps = phase1_85_external_js(
-        session, target, analyzer, js_files, ext_links, static_endpoints, found_maps, sourcemap_dir)
-    interceptor, dynamic_endpoints = phase3_dynamic(
-        target, analyzer, cookies, args, auth_headers, ext_links, static_endpoints)
-    found_maps = phase1_5b_phase3_sourcemaps(
-        session, target, analyzer, interceptor, js_files, static_endpoints, found_maps, sourcemap_dir)
+    # --disable-phase N skips a phase (ablations); phase 1 (discovery) always runs.
+    on = config.phase_enabled
+    found_maps = []
+    static_endpoints = analyzer.endpoints
+    backend_findings = []
+    interceptor, dynamic_endpoints = None, []
+
+    if on('1.5'):
+        js_files, found_maps = phase1_5_sourcemaps(session, target, js_files, analyzer, sourcemap_dir)
+    if on('2'):
+        static_endpoints = phase2_static_analysis(analyzer, js_files, json_files)
+    if on('1.55'):
+        js_files, found_maps = phase1_55_subapp_index_pages(
+            session, target, analyzer, js_files, static_endpoints, found_maps, sourcemap_dir)
+    if on('1.6'):
+        js_files, found_maps = phase1_6_bundle_discovery(
+            session, target, analyzer, js_files, static_endpoints, found_maps, sourcemap_dir)
+    if on('1.75'):
+        phase1_75_service_workers(session, target, hunter, analyzer)
+    if on('1.8'):
+        backend_findings = phase1_8_backend_intel(session, target, backend_dir, analyzer)
+    if on('1.85'):
+        found_maps = phase1_85_external_js(
+            session, target, analyzer, js_files, ext_links, static_endpoints, found_maps, sourcemap_dir)
+    if on('2.5'):
+        phase2_5_value_flow(analyzer)
+    if on('3'):
+        interceptor, dynamic_endpoints = phase3_dynamic(
+            target, analyzer, cookies, args, auth_headers, ext_links, static_endpoints)
+        if on('1.5b'):
+            found_maps = phase1_5b_phase3_sourcemaps(
+                session, target, analyzer, interceptor, js_files, static_endpoints, found_maps, sourcemap_dir)
+        if on('2.5'):
+            phase2_5_value_flow(analyzer)      # code first seen in the browser phase
 
     elapsed = time.time() - start_time
     print(f"\n[TIME] Total scan time: {elapsed:.1f}s")

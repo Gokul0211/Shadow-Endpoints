@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "shadow-scanner"
+version = "3.0.0.dev0"
+description = "API-surface discovery for single-page applications (static analysis, source maps, browser instrumentation)"
+requires-python = ">=3.10"
+dependencies = [
+    # Versions the test-suite and the paper's experiments were run with (2026-10).
+    "requests==2.34.2",
+    "beautifulsoup4==4.15.0",
+    "urllib3==2.6.3",
+    "esprima==4.0.1",
+    "openpyxl==3.1.5",
+]
+
+[project.optional-dependencies]
+browser = ["playwright==1.60.0"]       # dynamic phase (also: python -m playwright install chromium)
+excel = ["pandas==3.0.2"]
+
+[project.scripts]
+shadow-scanner = "shadow_scanner.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["shadow_scanner*"]

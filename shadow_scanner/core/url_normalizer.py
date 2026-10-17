@@ -1,6 +1,7 @@
 """URL normalization: relative paths -> absolute URLs, :param/${var} -> {param}."""
 import re
 import urllib.parse
+from shadow_scanner.core import diagnostics
 class URLNormalizer:
     """Normalizes endpoints to complete URLs, with path-parameter canonicalization.
 
@@ -69,7 +70,7 @@ class URLNormalizer:
                 (parsed.scheme, parsed.netloc, path,
                  parsed.params, parsed.query, parsed.fragment)
             )
-        except Exception:
-            pass
+        except Exception as _exc:
+            diagnostics.swallowed(__name__, _exc)
 
         return full

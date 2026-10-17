@@ -2,6 +2,7 @@
 import re
 import urllib.parse
 
+from shadow_scanner import config
 from shadow_scanner.config import (
     API_INDICATORS,
     FALSE_POSITIVE_PATTERNS,
@@ -14,6 +15,7 @@ from shadow_scanner.config import (
 from shadow_scanner.core.evidence import evidence_kind
 from shadow_scanner.core.scoring import BayesianConfidenceScorer, EndpointClassifier, LibraryFingerprint
 from shadow_scanner.static.ts_params import TypeScriptParameterExtractor
+from shadow_scanner.core import diagnostics
 class EndpointStoreMixin:
     """Validation, scoring and de-duplicated storage of every candidate endpoint."""
 
@@ -41,7 +43,7 @@ class EndpointStoreMixin:
         'VUE_FETCH', 'VUE_ASYNC_DATA', 'REACT_USE_EFFECT_FETCH', 'RTK_QUERY_ENDPOINT',
         'AST_HTTP_CALL', 'AST_COMPUTED_KEY', 'RPC_HTTP_CALL', 'RPC_DI_CHAIN',
         'ANGULAR_SERVICE_PROP_CONCAT', 'SOAP_BRIDGE_CALL', 'NEXTJS_COMMENT_ROUTE',
-        'GQL_TAG_QUERY', 'GQL_TAG_MUTATION', 'GQL_TAG_SUBSCRIPTION',
+        'GQL_TAG_QUERY', 'GQL_TAG_MUTATION', 'GQL_TAG_SUBSCRIPTION', 'VALUEFLOW_SINK',
         'WEBSOCKET', 'WEBSOCKET_STATIC_LITERAL', 'WEBSOCKET_DYNAMIC_CONCAT', 'WEBSOCKET_DYNAMIC_VAR',
     })
     # Types that pick the method from an identifier name (deleteTask -> DELETE).
@@ -116,6 +118,11 @@ class EndpointStoreMixin:
                 'register', 'signup', 'about', 'contact', 'help', 'support',
                 'privacy', 'terms', '404', '500', 'error', 'not-found',
             }
+            # glued or non-identifier placeholders mean an unresolved concatenation, not a path:
+            #   /{expr}1/workflow  /{var}audit  /{this.b}hazards/{e}
+            for _seg in _path_parts:
+                if re.search(r'\{[^}]*[^A-Za-z0-9_$}][^}]*\}', _seg) or re.match(r'^\{[A-Za-z0-9_$]+\}[A-Za-z0-9]', _seg):
+                    return None
             if (len(_path_parts) == 1
                     and _path_parts[0].lower() in _FRONTEND_SINGLE_SEGS
                     and not parsed_check.query):
@@ -139,8 +146,12 @@ class EndpointStoreMixin:
             return True
         return method != 'GET' and (type or '').upper() not in self.NAME_GUESS_TYPES
 
-    def add_endpoint(self, url, method, params, type, source, classification, confidence, extra_fields=None):
-        """Record one sighting of an endpoint (see the store comment above)."""
+    def add_endpoint(self, url, method, params, type, source, classification, confidence, extra_fields=None,
+                     evidence_extra=None):
+        """Record one sighting of an endpoint (see the store comment above).
+
+        evidence_extra: extra keys stored on this evidence item (e.g. the value-flow
+        sink details), reported under evidence[].detail."""
         if EndpointClassifier.is_hard_garbage(url):
             return
         kind = evidence_kind(type)
@@ -183,7 +194,13 @@ class EndpointStoreMixin:
             'score':           s_score,
             'vendor':          is_vendor,
             'phase':           getattr(self, 'current_phase', None),
+            'extractor':       getattr(self, '_extractor', None),
         }
+        if evidence_extra:
+            ev.update(evidence_extra)
+        _x = getattr(self, '_extractor', None)
+        if _x:
+            self.extractor_stats.setdefault(_x, {'sightings': 0, 'errors': 0})['sightings'] += 1
         if hasattr(self, 'provenance'):
             self.provenance.record(url_normalized, type or '', source_str, confidence)
 
@@ -240,7 +257,14 @@ class EndpointStoreMixin:
         cats = sorted({self.provenance._category(e['type'], e['source']) for e in evs}) if hasattr(self, 'provenance') else []
 
         # Methods: explicitly observed ones win; otherwise the most frequent guess.
-        explicit = sorted({e['method'] for e in evs if e['method_explicit']})
+        explicit_evs = [e for e in evs if e['method_explicit']]
+        # A method read off an actual call (value-flow sink), a request or a spec outranks the
+        # name/context-based method of the older regex extractors: when both exist, only the
+        # reliable ones count.
+        reliable = [e for e in explicit_evs if e['kind'] in ('runtime', 'spec') or e.get('extractor') == 'value_flow']
+        if reliable:
+            explicit_evs = reliable
+        explicit = sorted({e['method'] for e in explicit_evs})
         if explicit:
             non_get = [m for m in explicit if m != 'GET']
             entry['method'] = non_get[0] if len(explicit) > 1 and non_get else explicit[0]
@@ -289,24 +313,51 @@ class EndpointStoreMixin:
             # VERIFIED_API means "seen in browser traffic" - nothing else may claim it
             entry['classification'] = 'BACKEND_API'
         entry['probe_only'] = kinds == ['probe']
+        # an Authorization-style header set at a sink is evidence that the endpoint is authenticated;
+        # the absence of one is not evidence of the opposite, so the field stays None
+        if any((ev.get('detail') or {}).get('auth') for ev in evs):
+            entry['auth_required'] = True
+            entry['auth_method'] = 'authorization_header'
 
     def finalize_scores(self):
         """Recompute every record from its evidence (call before filtering/reporting)."""
         for entry in self.endpoints:
             self._refresh_entry(entry)
 
+    @staticmethod
+    def _is_prefix_artifact(entry, sorted_urls):
+        """A trailing-slash URL that only regex extractors saw, and that is the strict prefix of another
+        endpoint, is the literal head of a concatenation ('/api/admin/' + id), not an endpoint itself."""
+        url = entry['endpoint']
+        if not url.endswith('/'):
+            return False
+        origin = entry.get('origin', {})
+        if origin.get('evidence_kinds') != ['static']:
+            return False
+        if any(ev.get('extractor') == 'value_flow' for ev in entry.get('evidence', [])):
+            return False
+        import bisect
+        i = bisect.bisect_right(sorted_urls, url)
+        return i < len(sorted_urls) and sorted_urls[i].startswith(url) and sorted_urls[i] != url
+
     def materialize(self):
         """Report entries: one per (URL, explicitly observed method), evidence summarised."""
         self.finalize_scores()
         out = []
+        urls = sorted(e['endpoint'] for e in self.endpoints)
         for entry in self.endpoints:
+            if self._is_prefix_artifact(entry, urls):
+                continue
+            if (not config.INCLUDE_INFERRED
+                    and entry.get('origin', {}).get('evidence_kinds') == ['inferred']):
+                continue
             methods = entry.get('methods') or [entry.get('method', 'GET')]
             for m in methods:
                 e = {k: v for k, v in entry.items() if k != 'evidence'}
                 e['method'] = m
                 evs = [ev for ev in entry.get('evidence', [])
                        if ev['method'] == m or not ev['method_explicit']]
-                e['evidence'] = [{k: ev[k] for k in ('type', 'kind', 'source', 'method', 'phase')}
+                e['evidence'] = [{k: ev.get(k) for k in ('type', 'kind', 'source', 'method', 'phase', 'extractor', 'detail')}
                                  for ev in sorted(evs, key=lambda ev: (ev['kind'], ev['type'] or '', ev['source']))][:20]
                 out.append(e)
         return out
@@ -377,8 +428,8 @@ class EndpointStoreMixin:
             _p = urllib.parse.urlparse(url).path
             if _p and len(_p.strip('/')) == 1:
                 return False
-        except Exception:
-            pass
+        except Exception as _exc:
+            diagnostics.swallowed(__name__, _exc)
 
         # Block CSS unit paths like /px, /ms
         if re.search(r'/(?:px|ms|em|rem|vh|vw|pt)$', url):

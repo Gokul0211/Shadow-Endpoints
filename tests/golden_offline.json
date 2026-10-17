@@ -1,0 +1,17 @@
+{
+  "_comment": "Floors for the offline SPABench run (static phase + value flow; path-level strict precision/recall, method-level recall). Measured 2026-10-17 after scanner Phase C, minus 0.02. 'maps' also analyses the sources embedded in the served source maps. Raise when the scanner improves; a drop below means a regression. SPABench v3 is a development set for this scanner: these floors are regression guards, not evaluation results.",
+  "no_maps": {
+    "angular-permit":  {"precision": 0.75, "recall": 0.61, "method_recall": 0.55},
+    "angular-erp":     {"precision": 0.78, "recall": 0.93, "method_recall": 0.94},
+    "react-ecommerce": {"precision": 0.98, "recall": 0.98, "method_recall": 0.98},
+    "vue-portal":      {"precision": 0.90, "recall": 0.78, "method_recall": 0.83},
+    "nextjs-saas":     {"precision": 0.98, "recall": 0.41, "method_recall": 0.49}
+  },
+  "maps": {
+    "angular-permit":  {"precision": 0.83, "recall": 0.98, "method_recall": 0.96},
+    "angular-erp":     {"precision": 0.78, "recall": 0.93, "method_recall": 0.94},
+    "react-ecommerce": {"precision": 0.98, "recall": 0.98, "method_recall": 0.98},
+    "vue-portal":      {"precision": 0.90, "recall": 0.78, "method_recall": 0.83},
+    "nextjs-saas":     {"precision": 0.94, "recall": 0.91, "method_recall": 0.92}
+  }
+}

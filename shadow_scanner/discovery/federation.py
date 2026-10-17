@@ -9,6 +9,7 @@ from bs4 import BeautifulSoup, Comment
 
 from shadow_scanner.config import COMMON_ENDPOINTS, LOW_VALUE_JS, is_ignored_url
 from shadow_scanner import config
+from shadow_scanner.core import diagnostics
 class EnhancedFederationHunter:
     def __init__(self, session, target_url):
         self.session = session
@@ -84,8 +85,8 @@ class EnhancedFederationHunter:
                     # Previously, found endpoints were counted but never stored anywhere,
                     # so they never appeared in the final report.
                     self.found_json_files.add(test_url)
-            except Exception:
-                pass  # Endpoint doesn't exist, continue
+            except Exception as _exc:
+                diagnostics.swallowed(__name__, _exc)
 
         if found_count > 0:
             print(f"  [+] Probing discovered {found_count} active endpoints")
@@ -111,10 +112,10 @@ class EnhancedFederationHunter:
                         r.json()
                         self.found_json_files.add(url)
                         print(f"  [*] Found config: {path}")
-                    except json.JSONDecodeError:
-                        pass  # Not valid JSON
-            except requests.exceptions.Timeout:
-                pass  # Config file doesn't exist, timeout is expected
+                    except json.JSONDecodeError as _exc:
+                        diagnostics.swallowed(__name__, _exc)
+            except requests.exceptions.Timeout as _exc:
+                diagnostics.swallowed(__name__, _exc)
             except Exception as e:
                 # Only print unexpected errors
                 if "404" not in str(e) and "Connection" not in str(e):
@@ -143,12 +144,12 @@ class EnhancedFederationHunter:
                         try:
                             r.json()
                             self.found_json_files.add(full_url)
-                        except json.JSONDecodeError:
-                            pass
-                except requests.exceptions.Timeout:
-                    pass
-                except Exception:
-                    pass
+                        except json.JSONDecodeError as _exc:
+                            diagnostics.swallowed(__name__, _exc)
+                except requests.exceptions.Timeout as _exc:
+                    diagnostics.swallowed(__name__, _exc)
+                except Exception as _exc:
+                    diagnostics.swallowed(__name__, _exc)
 
     def crawl_html(self):
         """Crawl HTML for script tags"""

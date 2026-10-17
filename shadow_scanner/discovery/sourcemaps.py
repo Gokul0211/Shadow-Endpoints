@@ -7,6 +7,7 @@ import urllib.parse
 
 from shadow_scanner.config import logger
 from shadow_scanner import config
+from shadow_scanner.core import diagnostics
 # ==============================================================================
 # SOURCE MAP ENGINE - LEGITIMATE PASSIVE EXTRACTION
 # ==============================================================================
@@ -92,8 +93,8 @@ class SourceMapEngine:
                 with open(catalog_path, 'w', encoding='utf-8') as f:
                     json.dump(catalog, f, indent=2)
                 print(f"  Catalog saved → {catalog_path}")
-            except Exception:
-                pass
+            except Exception as _exc:
+                diagnostics.swallowed(__name__, _exc)
 
         return self.extracted_files, self.source_map_urls
 
@@ -325,8 +326,8 @@ class SourceMapEngine:
 
                     downloaded += 1
                     print(f"    ✓ {map_url.split('/')[-1]}")
-            except Exception:
-                pass
+            except Exception as _exc:
+                diagnostics.swallowed(__name__, _exc)
 
         return downloaded
 
@@ -441,12 +442,12 @@ class SourceMapEngine:
                         f.write(contents[i])
 
                     self.extracted_files.append(output_path)
-                except Exception:
-                    pass  # Skip files that fail to write
+                except Exception as _exc:
+                    diagnostics.swallowed(__name__, _exc)
 
-        except Exception:
+        except Exception as _exc:
             # print(f"    ✗ Failed to extract {os.path.basename(map_path)}")
-            pass
+            diagnostics.swallowed(__name__, _exc)
 
     def _process_source_map_index(self, source_map, map_path):
         """Handle source map index files (v3 spec)"""
@@ -499,7 +500,7 @@ class SourceMapEngine:
         # Skip developer absolute paths embedded in source maps.
         # These are local machine paths that got baked into the map's "sources" array.
         # Concatenating them with the base URL produces nonsense like:
-        #   https://storex.ril.com/Users/prasad.nandoskar/Documents/...
+        #   https://app.example.com/Users/someone/Documents/...
         if re.match(r'^/?(?:Users|home|[A-Z]:[/\\])', clean, re.IGNORECASE):
             return None
 
@@ -554,8 +555,8 @@ class SourceMapEngine:
                     self.extracted_files.append(dts_path)
                     found += 1
                     print(f"  [+] .d.ts found: {dts_url}")
-            except Exception:
-                pass
+            except Exception as _exc:
+                diagnostics.swallowed(__name__, _exc)
 
         self.dts_files = dts_files
         if probed:
@@ -660,10 +661,10 @@ def run_sourcemap_harvest(session, target, js_files, analyzer, output_dir=None):
                             analyzer.sourcemap_gql_endpoints.add(
                                 _spa_base_sm + _gp.rstrip('/')
                             )
-                except Exception:
-                    pass
-            except Exception:
-                pass
+                except Exception as _exc:
+                    diagnostics.swallowed(__name__, _exc)
+            except Exception as _exc:
+                diagnostics.swallowed(__name__, _exc)
         if ts_registered:
             print(f"[SOURCEMAP] Registered {ts_registered} TypeScript type(s) for parameter resolution")
         print("[SOURCEMAP] Integration complete")
@@ -698,8 +699,8 @@ def run_sourcemap_harvest(session, target, js_files, analyzer, output_dir=None):
                     # EXTERNAL_SUBDOMAIN_LITERAL all fire on MFE main.js bundles.
                     analyzer.analyze_code(code, js_url)
                     print(f"    ✓ {js_url.split('/')[-1]} ({len(code):,} bytes)")
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    diagnostics.swallowed(__name__, _exc)
             _new_count = len(analyzer.endpoints) - _snap
             if _new_count:
                 print(f"[SUBAPP DISCOVERY] +{_new_count} endpoint(s) from sub-app bundles")
@@ -714,8 +715,8 @@ def run_sourcemap_harvest(session, target, js_files, analyzer, output_dir=None):
                             code = f.read()
                         # full pipeline for extracted source files too
                         analyzer.analyze_code(code, filepath)
-                    except Exception:
-                        pass
+                    except Exception as _exc:
+                        diagnostics.swallowed(__name__, _exc)
             # Merge sub-app engine data
             if hasattr(analyzer, '_sourcemap_engine'):
                 existing = analyzer._sourcemap_engine

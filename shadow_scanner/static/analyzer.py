@@ -11,12 +11,14 @@ The class itself only holds state and the two orchestrators:
 
 Each technique lives in a mixin under static/stages/.
 """
-from shadow_scanner.config import LOW_VALUE_JS
+from shadow_scanner import config
+from shadow_scanner.config import LOW_VALUE_JS, logger
 from shadow_scanner.core.provenance import EndpointProvenanceGraph
 from shadow_scanner.core.rate_limiter import RateLimiter
 from shadow_scanner.core.scan_cache import ScanCache
 from shadow_scanner.core.url_normalizer import URLNormalizer
 from shadow_scanner.static.ast_engine.layer import ASTExtractionLayer
+from shadow_scanner.static.registry import CODE_EXTRACTORS
 from shadow_scanner.static.rpc_extractor import EnhancedRPCExtractor
 from shadow_scanner.static.security_headers import SecurityHeaderExtractor
 from shadow_scanner.static.stages.dynamic_imports import DynamicImportsMixin
@@ -29,11 +31,14 @@ from shadow_scanner.static.stages.literals import LiteralSweepMixin
 from shadow_scanner.static.stages.preprocessing import PreprocessingMixin
 from shadow_scanner.static.stages.routes import RoutePatternsMixin
 from shadow_scanner.static.stages.scan_steps import ScanStepsMixin
+from shadow_scanner.static.valueflow import ValueFlowMixin
 from shadow_scanner.static.ts_params import TypeScriptParameterExtractor
 from shadow_scanner.static.variable_resolver import EnhancedVariableResolver
+from shadow_scanner.core import diagnostics
 
 
 class EnhancedStaticAnalyzer(
+    ValueFlowMixin,
     ScanStepsMixin,
     PreprocessingMixin,
     DynamicImportsMixin,
@@ -64,7 +69,12 @@ class EnhancedStaticAnalyzer(
         self.normalizer = URLNormalizer(base_url)
         self.endpoints = []
         self._index = {}               # normalised URL -> record in self.endpoints
-        self.current_phase = '2'       # set by pipeline.py; stored on every evidence item
+        self.recorder = None           # core.run_meta.RunRecorder (per-phase time / requests)
+        self._extractor = None         # name of the extractor currently running
+        self.code_corpus = {}          # label -> code: everything fetched, for the value-flow analysis
+        self.value_flow_stats = None
+        self.extractor_stats = {}      # name -> {'sightings': n, 'errors': n}
+        self._phase = '2'
         self.resolver = EnhancedVariableResolver()
         self.rpc_extractor = EnhancedRPCExtractor(self.resolver)
         self.analyzed_js_files = set()
@@ -85,6 +95,20 @@ class EnhancedStaticAnalyzer(
         # all JS bundles and source-map-recovered files accumulate + dedupe.
         self._header_extractor = SecurityHeaderExtractor()
 
+    @property
+    def current_phase(self):
+        """Phase label stored on every evidence item; setting it also switches the
+        per-phase counters of the recorder and the HTTP client."""
+        return self._phase
+
+    @current_phase.setter
+    def current_phase(self, name):
+        self._phase = name
+        if self.recorder is not None:
+            self.recorder.start_phase(name)
+        if hasattr(self.session, 'set_phase'):
+            self.session.set_phase(name)
+
     # ── Phase 2 entry point ──────────────────────────────────────────────
     def scan(self, js_urls, json_urls):
         print("\n[PHASE 2] Enhanced Analysis with Method Call Resolution")
@@ -93,14 +117,15 @@ class EnhancedStaticAnalyzer(
         js_contents = self._fetch_and_extract_variables(js_urls)
         self._adopt_backend_api_host()
         self._resolve_cross_file_di_chains()
-        self._extract_rpc_and_array_endpoints(js_contents)
-        self._extract_service_property_endpoints()
+        self.run_extractor('rpc_patterns', self._extract_rpc_and_array_endpoints, js_contents)
+        self.run_extractor('array_harvest', self._extract_array_harvest_endpoints)
+        self.run_extractor('service_properties', self._extract_service_property_endpoints)
         self._analyze_all_code_parallel(js_contents, json_urls)
-        self._analyze_webpack_module_bodies(js_contents)
-        self._discover_static_websockets(js_contents)
+        self.run_extractor('webpack_modules', self._analyze_webpack_module_bodies, js_contents)
+        self.run_extractor('static_websockets', self._discover_static_websockets, js_contents)
         self._analyze_lazy_dynamic_imports(js_contents)
         self._drop_low_confidence_endpoints()
-        self._run_graphql_introspection()
+        self.run_extractor('graphql_introspection', self._run_graphql_introspection)
 
         print(f"\n  [+] Total endpoints discovered: {len(self.endpoints)}")
         # Expose js_contents for ServiceWorkerAnalyzer (called from main after scan())
@@ -114,6 +139,8 @@ class EnhancedStaticAnalyzer(
         """Analyze JavaScript code for endpoints (every technique, fixed order)."""
         if any(x in source.lower() for x in LOW_VALUE_JS):
             return
+        if '::' not in source:                 # webpack module bodies are slices of a bundle already kept
+            self.code_corpus.setdefault(source, code)
 
         # ── Security-relevant HTTP header mining ──────────────────────────────
         # Runs on the RAW code (before comment stripping) so we catch both the
@@ -121,53 +148,38 @@ class EnhancedStaticAnalyzer(
         # Cheap, self-contained, never raises. See SecurityHeaderExtractor.
         try:
             self._header_extractor.extract(code, source)
-        except Exception:
-            pass
+        except Exception as _exc:
+            diagnostics.swallowed(__name__, _exc)
 
         code = self._preprocess_code(code)
-        self._queue_dynamic_imports(code, source)
-        self._run_ast_layer(code, source)
+        self._queue_dynamic_imports(code, source)      # infrastructure: queues files, finds nothing itself
 
-        # HTTP clients
-        self._extract_angular_http_calls(code, source)
-        self._extract_named_axios_calls(code, source)
-        self._extract_nextjs_routes(code, source)
-        self._extract_internal_ip_urls(code, source)
-        self._extract_env_var_urls(code, source)
+        for name, method in CODE_EXTRACTORS:
+            self.run_extractor(name, getattr(self, method), code, source)
 
-        # Framework conventions
-        self._extract_trpc_procedures(code, source)
-        self._extract_nuxt_server_routes(code, source)
-        self._extract_graphql_tag_operations(code, source)
-        self._extract_tanstack_routes(code, source)
-        self._extract_jsdoc_openapi(code, source)
-        self._extract_rtk_query_endpoints(code, source)
-        self._extract_query_hooks(code, source)
+        self._queue_lazy_chunk_paths(code, source)     # infrastructure
+        self._queue_import_expressions(code, source)   # infrastructure
 
-        # URL-builder functions
-        self._extract_interprocedural_calls(code, source)
+    # ── extractor bookkeeping ────────────────────────────────────────────
+    def extractor_enabled(self, name):
+        return config.extractor_enabled(name)
 
-        # Call sites, sockets, SOAP
-        self._extract_router_navigation(code, source)
-        self._extract_fetch_and_hook_calls(code, source)
-        self._extract_url_constructor_calls(code, source)
-        self._extract_dynamic_websockets(code, source)
-        self._extract_url_builder_calls(code, source)
-        self._extract_promise_chain_calls(code, source)
-        self._extract_interceptor_base_urls(code, source)
-        self._extract_websocket_literals(code, source)
-        self._extract_soap_calls(code, source)
-        self._queue_lazy_chunk_paths(code, source)
-
-        # Storage / navigation / broad literal sweeps
-        self._extract_indexeddb_cache_keys(code, source)
-        self._extract_history_navigation(code, source)
-        self._extract_location_and_hash_routes(code, source)
-        self._extract_resolved_template_literals(code, source)
-        self._extract_api_string_literals(code, source)
-        self._extract_external_subdomain_literals(code, source)
-        self._linkfinder_sweep(code, source)
-        self._queue_import_expressions(code, source)
+    def run_extractor(self, name, fn, *args):
+        """Run one extractor if enabled. Its name is stored on every evidence item
+        it produces; an exception is logged and counted, and the other extractors
+        still run (it used to abort the rest of the file)."""
+        if not config.extractor_enabled(name):
+            return None
+        previous, self._extractor = self._extractor, name
+        try:
+            return fn(*args)
+        except Exception as exc:
+            st = self.extractor_stats.setdefault(name, {'sightings': 0, 'errors': 0})
+            st['errors'] += 1
+            logger.warning(f"[extractor {name}] {type(exc).__name__}: {exc}")
+            return None
+        finally:
+            self._extractor = previous
 
     def _run_ast_layer(self, code, source):
         """esprima AST extractors (call graphs, computed keys, templates, branches)."""
@@ -217,9 +229,9 @@ class EnhancedStaticAnalyzer(
                     confidence,
                     extra_fields=extra
                 )
-        except Exception:
+        except Exception as _exc:
             # Fallback contract: never suppress regex output on AST failure
-            pass
+            diagnostics.swallowed(__name__, _exc)
         # -------------------------------------------------------------------------
         # AST INTEGRATION END
         # -------------------------------------------------------------------------

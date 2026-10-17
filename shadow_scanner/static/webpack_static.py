@@ -3,6 +3,7 @@ import re
 from typing import TYPE_CHECKING
 
 from shadow_scanner.config import logger
+from shadow_scanner.core import diagnostics
 
 if TYPE_CHECKING:                       # type hint only - avoids a circular import
     from shadow_scanner.static.analyzer import EnhancedStaticAnalyzer
@@ -54,8 +55,8 @@ class StaticWebpackModuleAnalyzer:
             try:
                 self.analyzer.analyze_code_from_dynamic(module_src, label)
                 processed += 1
-            except Exception:
-                pass
+            except Exception as _exc:
+                diagnostics.swallowed(__name__, _exc)
 
         after    = len(self.analyzer.endpoints)
         new_eps  = after - before
@@ -89,8 +90,8 @@ class StaticWebpackModuleAnalyzer:
                     continue
                 block = self._extract_brace_block(code, obj_start)
                 modules.update(self._parse_module_map(block))
-            except Exception:
-                pass
+            except Exception as _exc:
+                diagnostics.swallowed(__name__, _exc)
 
         # ── Pattern C: webpack 4 webpackJsonp ──────────────────────────────
         # webpackJsonp([chunkId], {moduleId: function(module, exports, req){...}})
@@ -99,8 +100,8 @@ class StaticWebpackModuleAnalyzer:
                 obj_start = code.rindex('{', m.start(), m.end() + 1)
                 block = self._extract_brace_block(code, obj_start)
                 modules.update(self._parse_module_map(block))
-            except Exception:
-                pass
+            except Exception as _exc:
+                diagnostics.swallowed(__name__, _exc)
 
         # ── Pattern D: IIFE module array ────────────────────────────────────
         # (function(modules){...}([function(module,exports){...}, ...]))
@@ -151,8 +152,8 @@ class StaticWebpackModuleAnalyzer:
                 body = self._extract_brace_block(code, brace_pos)
                 if len(body) > 80:
                     modules[f'wp_assign_{mod_id}'] = body
-            except Exception:
-                pass
+            except Exception as _exc:
+                diagnostics.swallowed(__name__, _exc)
 
         return modules
 
@@ -190,8 +191,8 @@ class StaticWebpackModuleAnalyzer:
                 # Lower threshold: 40 chars — even short modules may have an endpoint
                 if len(body) > 40:
                     modules[mod_id] = body
-            except (ValueError, IndexError):
-                pass
+            except (ValueError, IndexError) as _exc:
+                diagnostics.swallowed(__name__, _exc)
         return modules
 
     @staticmethod

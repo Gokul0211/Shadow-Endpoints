@@ -2,6 +2,7 @@
 import re
 import urllib.parse
 from shadow_scanner import config
+from shadow_scanner.core import diagnostics
 class GraphQLIntrospector:
     """
     Automatically discovers and introspects GraphQL endpoints.
@@ -102,8 +103,8 @@ class GraphQLIntrospector:
                                     candidate = f"{gql_base}{path}"
                                     if candidate not in graphql_candidates:
                                         graphql_candidates.append(candidate)
-                        except Exception:
-                            pass
+                        except Exception as _exc:
+                            diagnostics.swallowed(__name__, _exc)
 
         print(f"  Found {len(graphql_candidates)} potential GraphQL endpoints")
 
@@ -150,8 +151,8 @@ class GraphQLIntrospector:
             if response.status_code in (400, 403, 200):
                 self._probe_persisted_queries(endpoint)
 
-        except Exception:
-            pass
+        except Exception as _exc:
+            diagnostics.swallowed(__name__, _exc)
 
         return False
 
@@ -187,8 +188,8 @@ class GraphQLIntrospector:
                     if endpoint not in self.apq_endpoints:
                         self.apq_endpoints.append(endpoint)
                     print(f"  [APQ] Automatic Persisted Queries confirmed on {endpoint}")
-        except Exception:
-            pass
+        except Exception as _exc:
+            diagnostics.swallowed(__name__, _exc)
 
         # 2. Apollo persisted query manifest
         base = endpoint.rsplit('/graphql', 1)[0] if '/graphql' in endpoint else endpoint.rsplit('/', 1)[0]
@@ -217,10 +218,10 @@ class GraphQLIntrospector:
                                 count += 1
                         if count:
                             print(f"  [APQ] {count} persisted operation(s) from manifest: {mpath}")
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+                    except Exception as _exc:
+                        diagnostics.swallowed(__name__, _exc)
+            except Exception as _exc:
+                diagnostics.swallowed(__name__, _exc)
 
     def _parse_schema(self, endpoint, schema):
         """Parse GraphQL schema and extract all operations"""

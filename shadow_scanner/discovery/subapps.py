@@ -3,6 +3,7 @@ import re
 import urllib.parse
 
 from bs4 import BeautifulSoup
+from shadow_scanner.core import diagnostics
 def _discover_subapp_bundles_postanalysis(session, target, static_endpoints, known_js_files):
     """
     After Phase 2 static analysis, mine discovered endpoints for sub-app paths
@@ -30,8 +31,8 @@ def _discover_subapp_bundles_postanalysis(session, target, static_endpoints, kno
                 seg = parts[0]
                 if not any(seg.startswith(x) for x in ('api', 'assets', 'login', 'static')):
                     subapp_paths.add(seg)
-        except Exception:
-            pass
+        except Exception as _exc:
+            diagnostics.swallowed(__name__, _exc)
 
     if not subapp_paths:
         return []
@@ -54,60 +55,40 @@ def _discover_subapp_bundles_postanalysis(session, target, static_endpoints, kno
                     found += 1
             if found:
                 print(f"  [1.6] /{path}/: +{found} new JS bundle(s)")
-        except Exception:
-            pass
+        except Exception as _exc:
+            diagnostics.swallowed(__name__, _exc)
 
     return new_js
 
 
 def _discover_subapp_index_pages(session, target, analyzer, known_js_files):
     """
-    Discover sub-application JS bundles by mining fetched JS content for
-    sub-app base path patterns (e.g. ui_rc_permit, ui_isolation) and probing
-    those paths as index HTML pages to extract their <script> bundles.
+    Find independently deployed sub-applications (micro-frontends served from their
+    own directory of the same origin) and collect the <script> bundles of their
+    index pages.
 
-    These sub-apps are independent Angular/React applications deployed at
-    separate base paths on the same origin (e.g. /ui_rc_permit/main.*.js).
+    Candidate directories come only from URLs the scan has already seen: the first
+    path segment of every same-origin script that is served from a sub-directory
+    (https://host/<dir>/main.js), including scripts that source maps pointed at.
+    No directory names are guessed.
     """
     parsed = urllib.parse.urlparse(target)
     origin = f"{parsed.scheme}://{parsed.netloc}"
 
-    # ── Step 1: mine sub-app paths from fetched JS content ──────────────
+    # Generic asset folders are not applications
+    _ASSET_DIRS = {'static', 'assets', 'dist', 'build', 'js', 'scripts', 'chunks', 'vendor', 'public', 'lib'}
     subapp_paths = set()
-    js_contents = getattr(analyzer, 'js_contents', {})
-    for url, code in js_contents.items():
-        # Pattern: ui_<service_name> — Angular enterprise convention
-        for m in re.finditer(r'["\'/](ui_[a-z][a-z0-9_]{2,30})["\'/]', code):
-            subapp_paths.add(m.group(1))
-        # Pattern: /app_<name>/ or /mod_<name>/
-        for m in re.finditer(r'["\']((?:app|mod|module|portal)_[a-z][a-z0-9_]{2,30})["\'/]', code):
-            subapp_paths.add(m.group(1))
-
-    # ── Step 2: also mine from source map HTML redirects ────────────────
-    if hasattr(analyzer, '_sourcemap_engine'):
-        eng = analyzer._sourcemap_engine
-        for js_url in getattr(eng, 'subapp_js_urls', []):
-            # Extract the base path from sub-app JS URLs
-            # e.g. https://rcow.ril.com/ui_isolation/main.*.js → ui_isolation
-            path = urllib.parse.urlparse(js_url).path
-            parts = path.strip('/').split('/')
-            if len(parts) >= 2:
-                candidate = parts[0]
-                if re.match(r'^(?:ui|app|mod|module|portal)_[a-z]', candidate):
-                    subapp_paths.add(candidate)
-
-    # ── Step 3: also mine from endpoints already discovered ─────────────
-    for ep in analyzer.endpoints:
-        ep_url = ep.get('endpoint', '')
-        try:
-            ep_path = urllib.parse.urlparse(ep_url).path
-            parts = ep_path.strip('/').split('/')
-            if parts:
-                seg = parts[0]
-                if re.match(r'^(?:ui|app|mod|module|portal)_[a-z]', seg):
-                    subapp_paths.add(seg)
-        except Exception:
-            pass
+    seen_scripts = set(known_js_files)
+    engine = getattr(analyzer, '_sourcemap_engine', None)
+    if engine is not None:
+        seen_scripts.update(getattr(engine, 'subapp_js_urls', []))
+    for js_url in seen_scripts:
+        u = urllib.parse.urlparse(js_url)
+        if u.netloc != parsed.netloc:
+            continue
+        parts = [p for p in u.path.split('/') if p]
+        if len(parts) >= 2 and not parts[0].startswith(('_', '.')) and parts[0].lower() not in _ASSET_DIRS:
+            subapp_paths.add(parts[0])
 
     if not subapp_paths:
         return []
@@ -161,8 +142,8 @@ def _discover_subapp_index_pages(session, target, analyzer, known_js_files):
             if found:
                 print(f"  [SUBAPP INDEX] /{path}/ '{title}': +{found} JS bundle(s)")
 
-        except Exception:
-            pass
+        except Exception as _exc:
+            diagnostics.swallowed(__name__, _exc)
 
     if new_js:
         print(f"[SUBAPP INDEX] Total: {len(new_js)} new JS bundle(s) from sub-app index pages")

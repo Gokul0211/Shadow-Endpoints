@@ -10,6 +10,7 @@ from shadow_scanner.dynamic.browser_scripts import INTERCEPTOR_SCRIPT
 from shadow_scanner.dynamic.indexeddb import IndexedDBExtractor
 from shadow_scanner.dynamic.webpack_runtime import WebpackModuleGraphReconstructor
 from shadow_scanner.protocols.websockets import WebSocketDiscovery
+from shadow_scanner.core import diagnostics
 # ==============================================================================
 # DYNAMIC INTERCEPTOR - ENHANCED WITH FEEDBACK LOOP
 # ==============================================================================
@@ -281,8 +282,8 @@ class DynamicInterceptor:
                         """ % _tok.replace("'", "\\'")
                         try:
                             page.add_init_script(_storage_script)
-                        except Exception:
-                            pass
+                        except Exception as _exc:
+                            diagnostics.swallowed(__name__, _exc)
 
                     ws_discovery.intercept_playwright_websockets(page)
                     page.on("response", self._handle_response)
@@ -298,7 +299,8 @@ class DynamicInterceptor:
                         nav_ok = True
                     except Exception:
                         try: page.stop()
-                        except Exception: pass
+                        except Exception as _exc:
+                            diagnostics.swallowed(__name__, _exc)
 
                     if not nav_ok:
                         continue
@@ -316,41 +318,41 @@ class DynamicInterceptor:
                             wpk_new = wpk_reconstructor.extract_from_page(page, self.analyzer)
                             if wpk_new:
                                 print(f"\n      [WPK] Module graph: {wpk_new} new endpoints")
-                        except Exception:
-                            pass
+                        except Exception as _exc:
+                            diagnostics.swallowed(__name__, _exc)
                         wpk_done = True
 
                     # ── route discovery ───────────────────────────────────────
                     try:
                         self._extract_routes_from_page(page)
-                    except Exception:
-                        pass
+                    except Exception as _exc:
+                        diagnostics.swallowed(__name__, _exc)
 
                     # ── active crawl (click buttons etc.) ────────────────────
                     try:
                         self._active_crawl_interactions(page)
-                    except Exception:
-                        pass
+                    except Exception as _exc:
+                        diagnostics.swallowed(__name__, _exc)
 
                     time.sleep(0.3)
 
                     # ── storage / IndexedDB ───────────────────────────────────
                     try:
                         self._extract_storage_data(page)
-                    except Exception:
-                        pass
+                    except Exception as _exc:
+                        diagnostics.swallowed(__name__, _exc)
                     try:
                         # FIX IDB: Wait for async IndexedDB writes before extracting
                         page.wait_for_timeout(2000)
                         idb_extractor.extract_from_page(page, self.analyzer)
-                    except Exception:
-                        pass
+                    except Exception as _exc:
+                        diagnostics.swallowed(__name__, _exc)
 
                     # ── WebSocket harvest ─────────────────────────────────────
                     try:
                         ws_discovery.extract_captured_websockets(page)
-                    except Exception:
-                        pass
+                    except Exception as _exc:
+                        diagnostics.swallowed(__name__, _exc)
 
                     # ── runtime API call harvest (fetch/XHR/SSE/beacon/axios/GraphQL) ──
                     self._harvest_runtime_api_calls(page)
@@ -358,15 +360,15 @@ class DynamicInterceptor:
                     # ── SSE endpoint harvest ──────────────────────────────────
                     self._harvest_sse_urls(page)
 
-                except Exception:
-                    pass   # never let one route kill the scan
+                except Exception as _exc:
+                    diagnostics.swallowed(__name__, _exc)
 
                 finally:
                     # GUARANTEED cleanup — this runs even if continue/break fired
                     try:
                         page.close()
-                    except Exception:
-                        pass
+                    except Exception as _exc:
+                        diagnostics.swallowed(__name__, _exc)
 
                     # ── Flush JS analysis queue (safe: outside Playwright event loop) ──
                     # Process any JS files captured during this page's network activity.
@@ -376,8 +378,8 @@ class DynamicInterceptor:
                         q_url, q_code = self.js_analysis_queue.popleft()
                         try:
                             self.analyzer.analyze_code_from_dynamic(q_code, q_url)
-                        except Exception:
-                            pass
+                        except Exception as _exc:
+                            diagnostics.swallowed(__name__, _exc)
 
             self._record_websocket_results(ws_discovery)
 
@@ -430,8 +432,8 @@ class DynamicInterceptor:
                     "confidence_score": confidence,
                     "origin": {"is_vendor": False, "extraction_type": ep_type, "provenance": ["RUNTIME"]},
                 })
-        except Exception:
-            pass
+        except Exception as _exc:
+            diagnostics.swallowed(__name__, _exc)
 
     def _harvest_sse_urls(self, page):
         """Read EventSource URLs captured by INTERCEPTOR_SCRIPT."""
@@ -445,8 +447,8 @@ class DynamicInterceptor:
                         "source": "EventSource", "classification": "SSE_ENDPOINT",
                         "confidence_score": 95,
                         "origin": {"is_vendor": False, "extraction_type": "RUNTIME_SSE"}})
-        except Exception:
-            pass
+        except Exception as _exc:
+            diagnostics.swallowed(__name__, _exc)
 
     def _record_websocket_results(self, ws_discovery):
         """Add Playwright-captured WebSocket connections and print a summary."""
@@ -932,5 +934,5 @@ class DynamicInterceptor:
             except Exception as _exc:
                 logger.debug(f"[Suppressed] {_exc}")
 
-        except Exception:
-            pass  # Don't let interaction failures stop the scan
+        except Exception as _exc:
+            diagnostics.swallowed(__name__, _exc)

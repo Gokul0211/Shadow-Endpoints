@@ -89,6 +89,27 @@ def is_ignored_host(host: str) -> bool:
 # False; URLs the target's own code references are still fetched.
 PROBING_ENABLED = True
 
+# Endpoints supported only by inference (a file name, a convention) are left out of the report
+# unless this is True (CLI: --include-inferred).
+INCLUDE_INFERRED = False
+
+
+# Ablation switches (CLI: --disable-phase / --disable-extractor / --only-extractor).
+# Names are listed in static/registry.py.
+DISABLED_PHASES = set()
+DISABLED_EXTRACTORS = set()
+ONLY_EXTRACTORS = None          # None = all; otherwise the only extractors that run
+
+
+def phase_enabled(phase: str) -> bool:
+    return str(phase) not in DISABLED_PHASES
+
+
+def extractor_enabled(name: str) -> bool:
+    if ONLY_EXTRACTORS is not None and name not in ONLY_EXTRACTORS:
+        return False
+    return name not in DISABLED_EXTRACTORS
+
 
 def site_of(host: str) -> str:
     """Registrable-domain approximation: last two labels (whole host for IPs / localhost)."""

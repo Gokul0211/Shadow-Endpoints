@@ -5,6 +5,7 @@ import re
 import requests
 
 from shadow_scanner.config import API_INDICATORS, NOISE_KEYWORDS, NOISE_PATTERNS, is_ignored_url
+from shadow_scanner.core import diagnostics
 class JsonConfigMixin:
     """Endpoint extraction from JSON config files (environment.json etc.)."""
 
@@ -20,12 +21,12 @@ class JsonConfigMixin:
 
             self._extract_from_json(data, filename, json_url)
 
-        except json.JSONDecodeError:
-            pass  # Not valid JSON
-        except requests.exceptions.Timeout:
-            pass  # Timeout
-        except Exception:
-            pass  # Other errors
+        except json.JSONDecodeError as _exc:
+            diagnostics.swallowed(__name__, _exc)
+        except requests.exceptions.Timeout as _exc:
+            diagnostics.swallowed(__name__, _exc)
+        except Exception as _exc:
+            diagnostics.swallowed(__name__, _exc)
 
     def _extract_from_json(self, data, filename, source_url, path=''):
         """Recursively extract ALL string values from JSON"""

@@ -10,6 +10,7 @@ from shadow_scanner.config import LOW_VALUE_JS, logger
 from shadow_scanner.protocols.graphql import GraphQLIntrospector
 from shadow_scanner.protocols.websockets import WebSocketDiscovery
 from shadow_scanner.static.webpack_static import StaticWebpackModuleAnalyzer
+from shadow_scanner.core import diagnostics
 class ScanStepsMixin:
     """The individual steps of EnhancedStaticAnalyzer.scan() (Phase 2)."""
 
@@ -94,8 +95,8 @@ class ScanStepsMixin:
                     self.normalizer.scheme = parsed.scheme
                     self.normalizer.netloc = parsed.netloc
                     break
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    diagnostics.swallowed(__name__, _exc)
 
     def _resolve_cross_file_di_chains(self):
         """Multi-pass resolution of cross-file DI chains (service -> config -> env URL)."""
@@ -194,7 +195,10 @@ class ScanStepsMixin:
                 )
                 rpc_count += 1
 
-        # Array-harvested items are global (one pass, not once per file)
+        print(f"    [+] Found {rpc_count} RPC-style endpoints")
+
+    def _extract_array_harvest_endpoints(self):
+        """Array-harvested CRUD-looking names (one global pass)."""
         for var_name, var_data in sorted(self.resolver.variables.items()):
             if var_name.startswith("ARRAY_ITEM_"):
                 raw_val = var_data['value']
@@ -249,7 +253,6 @@ class ScanStepsMixin:
                     60
                 )
 
-        print(f"    [+] Found {rpc_count} RPC-style endpoints")
 
     def _extract_service_property_endpoints(self):
         """Step 3: this.prop = this.method() + "/suffix" service properties."""
@@ -285,10 +288,7 @@ class ScanStepsMixin:
         # speed-up under the GIL) and insertion order used to decide ties, so
         # the old thread pool made results vary between runs (S14).
         for json_url in sorted(set(json_urls)):
-            try:
-                self.analyze_json_config(json_url)
-            except Exception as exc:
-                logger.warning(f"[analyze] JSON config {json_url}: {exc}")
+            self.run_extractor('json_config', self.analyze_json_config, json_url)
 
         for url, code in sorted(js_contents.items()):
             try:
@@ -311,8 +311,8 @@ class ScanStepsMixin:
                 new_from_wpk = _wpk_static.analyze_bundle(_code, _url)
                 if new_from_wpk > 0:
                     _wpk_bundles += 1
-            except Exception:
-                pass
+            except Exception as _exc:
+                diagnostics.swallowed(__name__, _exc)
         _wpk_new = len(self.endpoints) - _wpk_snap
         if _wpk_new:
             print(f"  [WPK-STATIC] {_wpk_new} endpoint(s) from webpack module bodies ({_wpk_bundles} bundles)")
@@ -379,8 +379,8 @@ class ScanStepsMixin:
                     js_contents[_dyn_url] = _dyn_code
                     self.analyzed_js_files.add(_dyn_url)
                     print(f"    ✓ {_dyn_url.split('/')[-1]} ({len(_dyn_code):,} bytes)")
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    diagnostics.swallowed(__name__, _exc)
             _dyn_new = len(self.endpoints) - _dyn_snap
             if _dyn_new:
                 print(f"  [GAP2-DynamicImports] +{_dyn_new} endpoint(s) from lazy chunks")
@@ -480,10 +480,10 @@ class ScanStepsMixin:
                                     }
                                     if _keys & _gql_indicator_keys:
                                         _spa_hosts_gql = True
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
+                            except Exception as _exc:
+                                diagnostics.swallowed(__name__, _exc)
+                except Exception as _exc:
+                    diagnostics.swallowed(__name__, _exc)
 
             # SIGNAL 3: POST introspection fallback (works when proxy is reachable)
             if not _spa_hosts_gql:
@@ -505,10 +505,10 @@ class ScanStepsMixin:
                                     'data' in _pj or 'errors' in _pj
                                 ):
                                     _spa_hosts_gql = True
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
+                            except Exception as _exc:
+                                diagnostics.swallowed(__name__, _exc)
+                except Exception as _exc:
+                    diagnostics.swallowed(__name__, _exc)
 
             if _spa_hosts_gql:
                 for gql_ep in graphql_schemas:

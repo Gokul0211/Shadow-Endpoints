@@ -33,12 +33,14 @@ class EndpointProvenanceGraph:
         'CONFIG':    0.85,
         'SOURCEMAP': 0.80,
         'PROBE':     0.70,
+        'INFERRED':  0.30,
         'STATIC':    0.65,
         'STORAGE':   0.75,
         'UNKNOWN':   0.40,
     }
 
-    _KIND_TO_CATEGORY = {'runtime': 'RUNTIME', 'spec': 'SCHEMA', 'probe': 'PROBE', 'storage': 'STORAGE'}
+    _KIND_TO_CATEGORY = {'runtime': 'RUNTIME', 'spec': 'SCHEMA', 'probe': 'PROBE', 'storage': 'STORAGE',
+                         'inferred': 'INFERRED'}
     _CONFIG_TYPES = frozenset({'JSON_CONFIG', 'ENVIRONMENT_URL', 'ENV_VAR_CONCAT'})
     _MAP_SOURCE_EXT = ('.ts', '.tsx', '.jsx', '.vue', '.svelte', '.mts', '.cts')
 

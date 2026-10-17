@@ -1,6 +1,7 @@
 """Pre-processing: comment stripping, FP neutralisation, de-obfuscation."""
 import re
 import urllib.parse
+from shadow_scanner.core import diagnostics
 class PreprocessingMixin:
     """Source pre-processing applied before any extractor runs."""
 
@@ -98,8 +99,8 @@ class PreprocessingMixin:
                 decoded = _b64.b64decode(m.group(1) + '==').decode('utf-8', errors='ignore')
                 if decoded and ('/' in decoded or 'api' in decoded.lower()):
                     decoded_fragments.append(f'"{decoded}"')
-            except Exception:
-                pass
+            except Exception as _exc:
+                diagnostics.swallowed(__name__, _exc)
 
         # ── 2. String.fromCharCode() ───────────────────────────────────────
         for m in re.finditer(r'String\.fromCharCode\s*\(([0-9,\s]{3,200})\)', code):
@@ -108,8 +109,8 @@ class PreprocessingMixin:
                 decoded = ''.join(chr(c) for c in chars if 32 <= c < 128)
                 if decoded and ('/' in decoded or 'api' in decoded.lower()):
                     decoded_fragments.append(f'"{decoded}"')
-            except Exception:
-                pass
+            except Exception as _exc:
+                diagnostics.swallowed(__name__, _exc)
 
         # ── 3. Hex escape sequences in string literals ─────────────────────
         for m in re.finditer(r'["\'](?:\\x[0-9a-fA-F]{2}){2,50}["\']', code):
@@ -118,8 +119,8 @@ class PreprocessingMixin:
                 decoded = raw.encode('raw_unicode_escape').decode('unicode_escape')
                 if decoded and ('/' in decoded or 'api' in decoded.lower()):
                     decoded_fragments.append(f'"{decoded}"')
-            except Exception:
-                pass
+            except Exception as _exc:
+                diagnostics.swallowed(__name__, _exc)
 
         # ── 4. unescape() / decodeURIComponent() ──────────────────────────
         for m in re.finditer(
@@ -132,8 +133,8 @@ class PreprocessingMixin:
                 decoded = urllib.parse.unquote(raw)
                 if decoded and ('/' in decoded or 'api' in decoded.lower()):
                     decoded_fragments.append(f'"{decoded}"')
-            except Exception:
-                pass
+            except Exception as _exc:
+                diagnostics.swallowed(__name__, _exc)
 
         # ── 5. eval() with direct string literal ──────────────────────────
         for m in re.finditer(r'\beval\s*\(\s*["\']([^"\']{4,200})["\']', code):
@@ -234,8 +235,8 @@ class PreprocessingMixin:
                         chars = [int(c.strip()) for c in encoded.split(',')
                                  if c.strip().isdigit()]
                         decoded_val = ''.join(chr(c) for c in chars if 32 <= c < 128)
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    diagnostics.swallowed(__name__, _exc)
                 if decoded_val and ('/' in decoded_val or 'api' in decoded_val.lower()):
                     decoded_fragments.append(f'"{decoded_val}"')
 

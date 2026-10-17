@@ -61,6 +61,9 @@ class RateLimiter:
         Drop-in wrapper around session.get() that applies rate limiting
         and handles 429/503 with automatic retry (up to 3 attempts).
         """
+        if hasattr(session, 'rate_limiter') and hasattr(session, 'stats'):
+            # HttpClient already rate-limits, retries and counts this request
+            return session.get(url, **kwargs)
         max_attempts = 3
         resp = None
         for attempt in range(max_attempts):

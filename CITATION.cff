@@ -1,0 +1,9 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "Shadow Endpoints / SPABench"
+type: software
+authors:
+  - name: "Gokul0211"   # replace with the author names as they should appear in citations
+version: "3.0.0-dev"
+date-released: 2026-10-17
+license: MIT

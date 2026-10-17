@@ -16,9 +16,12 @@ import sys
 import requests
 
 from shadow_scanner.auth import AuthEngine
+from shadow_scanner.core.http_client import HttpClient
 from shadow_scanner.core.rate_limiter import RateLimiter
+from shadow_scanner.core.run_meta import RunRecorder, apply_env_secrets
 from shadow_scanner.core.scan_cache import ScanCache
 from shadow_scanner.pipeline import run_scan
+from shadow_scanner.static.registry import PHASES, extractor_names
 from shadow_scanner.reporting.report import save_report
 from shadow_scanner.static.analyzer import EnhancedStaticAnalyzer
 
@@ -83,11 +86,32 @@ Examples:
                         help='Path to scan cache file (default: no cache). Enables resume support. '
                              'Note: file content is not persisted to disk, so --resume skips re-fetching '
                              'only for files already in memory from the current session.')
+    parser.add_argument('--disable-phase', action='append', default=[], metavar='PHASE',
+                        help='Skip a pipeline phase (repeatable; ablations). Phases: '
+                             + ', '.join(PHASES) + '. Phase 1 (discovery) always runs.')
+    parser.add_argument('--disable-extractor', action='append', default=[], metavar='NAME',
+                        help='Switch off one extractor (repeatable; ablations). See --list-extractors.')
+    parser.add_argument('--only-extractor', action='append', default=None, metavar='NAME',
+                        help='Run only the named extractors (repeatable; add-one-in ablations).')
+    parser.add_argument('--list-extractors', action='store_true',
+                        help='Print the names accepted by --disable-extractor / --only-extractor and exit.')
+    parser.add_argument('--include-inferred', action='store_true',
+                        help='Also report endpoints supported only by inference (e.g. pages/api/<file> routes '
+                             'guessed from file names); they are left out by default.')
     parser.add_argument('--no-probe', action='store_true',
                         help='Do not request well-known paths that nothing references (common API '
                              'paths, OpenAPI/Actuator/WSDL/Next.js/GraphQL locations, service-worker '
                              'names, .d.ts guesses). URLs the target\'s code references are still '
                              'fetched. Probe-derived findings are always tagged as such in the report.')
+    parser.add_argument('--max-requests', type=int, default=None, metavar='N',
+                        help='Stop sending HTTP requests after N requests (budget; default: unlimited).')
+    parser.add_argument('--max-bytes', type=int, default=None, metavar='BYTES',
+                        help='Stop sending HTTP requests once N response bytes were received.')
+    parser.add_argument('--request-log', type=str, default=None, metavar='FILE',
+                        help='Write one JSON line per request (method, URL with secret query values '
+                             'masked, status, bytes, seconds, phase). Headers and bodies are never logged.')
+    parser.add_argument('--verify-tls', action='store_true',
+                        help='Verify TLS certificates (default: off, as in earlier versions).')
     parser.add_argument('--resume', action='store_true',
                         help='Resume a previous scan using the cache file specified by --cache. '
                              'Skips already-fetched JS files. Requires --cache.')
@@ -325,16 +349,40 @@ def main():
     try:
         # Parse command-line arguments
         args = parse_args()
+        # Secrets may come from SHADOW_PASSWORD / SHADOW_BEARER / SHADOW_COOKIES /
+        # SHADOW_MFA_SECRET so they need not be typed on the command line.
+        apply_env_secrets(args)
+        if args.list_extractors:
+            print('\n'.join(extractor_names()))
+            return
+        from shadow_scanner import config as _config
+        unknown = [n for n in (args.disable_extractor + (args.only_extractor or []))
+                   if n not in extractor_names()] + [p for p in args.disable_phase if p not in PHASES]
+        if unknown:
+            print(f"[X] Unknown phase/extractor name(s): {', '.join(unknown)} (see --list-extractors)")
+            sys.exit(2)
+        _config.DISABLED_PHASES = set(args.disable_phase)
+        _config.DISABLED_EXTRACTORS = set(args.disable_extractor)
+        _config.ONLY_EXTRACTORS = set(args.only_extractor) if args.only_extractor else None
+        if args.include_inferred:
+            from shadow_scanner import config as _ci
+            _ci.INCLUDE_INFERRED = True
         if args.no_probe:
             from shadow_scanner import config
             config.PROBING_ENABLED = False
             print("[*] Probing disabled (--no-probe)")
         target = _resolve_target(args)
         _check_connectivity(target)
-        session = _build_session()
-        cookies, auth_headers = _authenticate(args, session, target)
         _configure_verbose_logging(args)
         rate_limiter = _build_rate_limiter(args)
+        recorder = RunRecorder()
+        session = HttpClient(_build_session(), rate_limiter=rate_limiter,
+                             max_requests=args.max_requests, max_bytes=args.max_bytes,
+                             verify=True if args.verify_tls else None,
+                             log_path=args.request_log)
+        recorder.http = session
+        args._recorder = recorder          # not a CLI option; never serialised (see run_meta)
+        cookies, auth_headers = _authenticate(args, session, target)
         _report_worker_config(args)
         scan_cache = _build_scan_cache(args)
 

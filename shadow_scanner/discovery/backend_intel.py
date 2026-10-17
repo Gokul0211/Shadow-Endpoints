@@ -8,6 +8,7 @@ import urllib.parse
 from shadow_scanner import config
 from shadow_scanner.config import is_first_party
 from shadow_scanner.discovery.sourcemaps import run_sourcemap_harvest
+from shadow_scanner.core import diagnostics
 # ==============================================================================
 # EXPOSED API INTELLIGENCE HARVESTER
 # Replaces the old BackendFileHunter with 3 academically rigorous categories:
@@ -129,8 +130,8 @@ class BackendFileHunter:
                         api_base = f"{p.scheme}://{p.netloc}"
                         if api_base != self.base_url:
                             _extra_base_urls.add(api_base)
-                    except Exception:
-                        pass
+                    except Exception as _exc:
+                        diagnostics.swallowed(__name__, _exc)
             # Also check resolved variables for full URLs with different hosts
             for var_name, var_data in resolver.variables.items():
                 val = var_data.get('value', '') if isinstance(var_data, dict) else (var_data if isinstance(var_data, str) else '')
@@ -140,8 +141,8 @@ class BackendFileHunter:
                         api_base = f"{p.scheme}://{p.netloc}"
                         if api_base != self.base_url:
                             _extra_base_urls.add(api_base)
-                    except Exception:
-                        pass
+                    except Exception as _exc:
+                        diagnostics.swallowed(__name__, _exc)
 
         _extra_base_urls = {u for u in _extra_base_urls if is_first_party(u, self.base_url)}
 
@@ -179,8 +180,8 @@ class BackendFileHunter:
                         candidate = f"{p.scheme}://{p.netloc}"
                         if candidate != self.base_url and is_first_party(candidate, self.base_url):
                             _all_actuator_hosts.add(candidate)
-                    except Exception:
-                        pass
+                    except Exception as _exc:
+                        diagnostics.swallowed(__name__, _exc)
         for api_base in sorted(_all_actuator_hosts):
             saved_base = self.base_url
             self.base_url = api_base
@@ -237,10 +238,10 @@ class BackendFileHunter:
                                         f'pages-manifest:{mpath}', 'BACKEND_API', 88
                                     )
                                 count += 1
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+                    except Exception as _exc:
+                        diagnostics.swallowed(__name__, _exc)
+            except Exception as _exc:
+                diagnostics.swallowed(__name__, _exc)
 
         # 2. Probe common Next.js API paths directly
         nextjs_common = [
@@ -273,8 +274,8 @@ class BackendFileHunter:
                             'BackendFileHunter', 'BACKEND_API', 82
                         )
                     count += 1
-            except Exception:
-                pass
+            except Exception as _exc:
+                diagnostics.swallowed(__name__, _exc)
 
         return count
 
@@ -316,8 +317,8 @@ class BackendFileHunter:
                         api_host = f"{parsed.scheme}://{parsed.netloc}"
                         if api_host not in hosts_to_probe:
                             hosts_to_probe.append(api_host)
-                    except Exception:
-                        pass
+                    except Exception as _exc:
+                        diagnostics.swallowed(__name__, _exc)
 
         referenced = self._referenced_wsdl()
         for _h in referenced:
@@ -394,8 +395,8 @@ class BackendFileHunter:
                                 if pr.status_code in (200, 405, 404, 301, 302):
                                     soap_base = probe_url
                                     break
-                            except Exception:
-                                pass
+                            except Exception as _exc:
+                                diagnostics.swallowed(__name__, _exc)
 
                     # 4. Fall back: URL without ?wsdl suffix
                     if not soap_base:
@@ -422,8 +423,8 @@ class BackendFileHunter:
                                     # Remap the path onto the SPA host
                                     remapped = f"{spa_parsed.scheme}://{spa_parsed.netloc}{sb_parsed.path}"
                                     soap_bases_to_emit.append(remapped.rstrip('/'))
-                            except Exception:
-                                pass
+                            except Exception as _exc:
+                                diagnostics.swallowed(__name__, _exc)
 
                         for sbase in soap_bases_to_emit:
                             endpoint_url = f"{sbase}/{op}"
@@ -634,18 +635,18 @@ class BackendFileHunter:
         if 'json' in ct or url.endswith('.json') or url.endswith('api-docs'):
             try:
                 return json.loads(text)
-            except Exception:
-                pass
+            except Exception as _exc:
+                diagnostics.swallowed(__name__, _exc)
 
         # YAML
         if 'yaml' in ct or url.endswith(('.yaml', '.yml')):
             try:
                 import yaml  # type: ignore
                 return yaml.safe_load(text)
-            except ImportError:
-                pass
-            except Exception:
-                pass
+            except ImportError as _exc:
+                diagnostics.swallowed(__name__, _exc)
+            except Exception as _exc:
+                diagnostics.swallowed(__name__, _exc)
             return self._minimal_yaml_paths_parse(text)
 
         # HTML page with embedded spec (Redoc, Scalar, SwaggerUI)
@@ -658,8 +659,8 @@ class BackendFileHunter:
                     r2 = self.session.get(spec_url, timeout=8, verify=False)
                     if r2.status_code == 200:
                         return json.loads(r2.text)
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    diagnostics.swallowed(__name__, _exc)
 
             # SwaggerUI / Scalar embedded JSON blobs
             for pat in (
@@ -671,8 +672,8 @@ class BackendFileHunter:
                 if m:
                     try:
                         return json.loads(m.group(1))
-                    except Exception:
-                        pass
+                    except Exception as _exc:
+                        diagnostics.swallowed(__name__, _exc)
 
             # Last resort: find largest JSON blob in page that has "paths" key
             blobs = re.findall(r'(\{[^{}]{200,}\})', text, re.S)
@@ -1095,8 +1096,8 @@ class BackendFileHunter:
                     full_hash = _hh.md5(body).hexdigest()
                     head_hash = _hh.md5(body[:512]).hexdigest()
                     self._spa_fingerprints.add((len(body), full_hash, head_hash))
-            except Exception:
-                pass
+            except Exception as _exc:
+                diagnostics.swallowed(__name__, _exc)
         if self._spa_fingerprints:
             sizes = [str(s) for s, _, _ in self._spa_fingerprints]
             print(f"  [SPA FINGERPRINT] Catch-all detected: sizes={sizes}")

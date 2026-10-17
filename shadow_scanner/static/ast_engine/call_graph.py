@@ -9,6 +9,7 @@ Inter-procedural AST call-graph engines.
 import re
 
 from shadow_scanner.static.ast_engine.walker import walk
+from shadow_scanner.core import diagnostics
 class ASTCallGraphExtractor:
     """
     EXTRACTOR 5 — True AST-based interprocedural call graph.
@@ -411,8 +412,8 @@ class ASTCallGraphExtractor:
                                or self.scope.get(int_key))
                         if val is not None:
                             return val
-                    except (ValueError, TypeError):
-                        pass
+                    except (ValueError, TypeError) as _exc:
+                        diagnostics.swallowed(__name__, _exc)
 
         return None
 
@@ -993,8 +994,8 @@ class ASTCallGraph:
                     try:
                         int_key = f'{obj_n}.{int(idx_val)}'
                         return self._param_args.get(int_key) or self.scope.get(int_key)
-                    except (ValueError, TypeError):
-                        pass
+                    except (ValueError, TypeError) as _exc:
+                        diagnostics.swallowed(__name__, _exc)
 
         return None
 

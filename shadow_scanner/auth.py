@@ -7,6 +7,7 @@ import requests
 from bs4 import BeautifulSoup
 
 from shadow_scanner.config import PLAYWRIGHT_AVAILABLE
+from shadow_scanner.core import diagnostics
 # ==============================================================================
 # AUTH ENGINE — Login automation + token extraction
 # ==============================================================================
@@ -225,8 +226,8 @@ class AuthEngine:
                         submitted = True
                         print(f"[AUTH]   Clicked submit: {submit_sel}")
                         break
-                    except Exception:
-                        pass
+                    except Exception as _exc:
+                        diagnostics.swallowed(__name__, _exc)
 
                 if not submitted:
                     # Last resort: press Enter in the password field
@@ -236,8 +237,8 @@ class AuthEngine:
                 # ── Wait for navigation after submit ────────────────────
                 try:
                     page.wait_for_load_state('networkidle', timeout=10000)
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    diagnostics.swallowed(__name__, _exc)
 
                 # ── MFA / TOTP handling ─────────────────────────────────
                 if mfa_secret:
@@ -281,8 +282,8 @@ class AuthEngine:
         try:
             body = response.json()
             self._extract_tokens_from_dict(body)
-        except Exception:
-            pass
+        except Exception as _exc:
+            diagnostics.swallowed(__name__, _exc)
 
         # 2. Raw text (covers HTML pages that inline a token)
         self._extract_tokens_from_text(response.text)
@@ -312,8 +313,8 @@ class AuthEngine:
                 entries = json.loads(raw)
                 for key, value in entries:
                     self._check_and_store_token(key, value)
-            except Exception:
-                pass
+            except Exception as _exc:
+                diagnostics.swallowed(__name__, _exc)
 
         # Common window globals where SPAs stash tokens
         for global_var in [
@@ -325,8 +326,8 @@ class AuthEngine:
                 val = page.evaluate(f'() => {{ try {{ return JSON.stringify({global_var}) }} catch(e) {{ return null }} }}')
                 if val and val != 'null':
                     self._extract_tokens_from_text(val)
-            except Exception:
-                pass
+            except Exception as _exc:
+                diagnostics.swallowed(__name__, _exc)
 
         if self.tokens:
             for name, value in self.tokens.items():
@@ -470,8 +471,8 @@ class AuthEngine:
                 try:
                     if page.query_selector(sel):
                         return sel
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    diagnostics.swallowed(__name__, _exc)
 
         is_password = (candidates == self._PASS_FIELDS)
         if is_password:
@@ -479,16 +480,16 @@ class AuthEngine:
                 try:
                     if page.query_selector(sel):
                         return sel
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    diagnostics.swallowed(__name__, _exc)
         else:
             for sel in ['input[type="email"]', 'input[type="text"]', 'input[name*="user"]',
                         'input[name*="email"]', 'input[id*="user"]', 'input[id*="email"]']:
                 try:
                     if page.query_selector(sel):
                         return sel
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    diagnostics.swallowed(__name__, _exc)
 
         for name in candidates:
             for sel in [f'input[name="{name}"]', f'input[id="{name}"]',
@@ -496,8 +497,8 @@ class AuthEngine:
                 try:
                     if page.query_selector(sel):
                         return sel
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    diagnostics.swallowed(__name__, _exc)
         return None
 
     def _extract_csrf_from_html(self, soup) -> str:
@@ -541,8 +542,8 @@ class AuthEngine:
                     print(f"[AUTH]   MFA code submitted: {code}")
                     page.wait_for_load_state('networkidle', timeout=8000)
                     return
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    diagnostics.swallowed(__name__, _exc)
         except Exception as e:
             print(f"[AUTH]   MFA handling error: {e}")
 

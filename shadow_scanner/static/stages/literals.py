@@ -3,6 +3,7 @@ import re
 import urllib.parse
 
 from shadow_scanner.config import is_ignored_host, is_noise
+from shadow_scanner.core import diagnostics
 class LiteralSweepMixin:
     """Broad string-literal sweeps (template literals, LinkFinder-style regexes, IPs, env vars)."""
 
@@ -30,8 +31,8 @@ class LiteralSweepMixin:
                 _base_host = urllib.parse.urlparse(self.base_url).netloc
                 if _priv_host == _base_host:
                     continue
-            except Exception:
-                pass
+            except Exception as _exc:
+                diagnostics.swallowed(__name__, _exc)
             if not is_noise(_priv_url):
                 self.add_endpoint(
                     _priv_url, 'GET', [], 'INTERNAL_IP_HARDCODED',
@@ -194,7 +195,7 @@ class LiteralSweepMixin:
     def _extract_external_subdomain_literals(self, code, source):
         """Full https:// URLs on other hosts that carry an API-looking path."""
         # RC2b-FIX: External subdomain URLs embedded as full https:// strings inside JS
-        # Catches: 'https://rcowgis.ril.com/gistorcow/Api/Permit/DeleteEquipment'
+        # Catches: 'https://gis.example.com/service/Api/Item/Delete'
         # These go through the ExternalLinkExtractor for classification but ALSO need to
         # enter the endpoint pool when they carry an API path (not just CDN/analytics noise).
         for m in re.finditer(r'["\`](https?://([^/\s"\'`<>{}]{4,})/([A-Za-z][^"\'`\s<>{}]{4,}))["\`]', code):
@@ -308,10 +309,14 @@ class LiteralSweepMixin:
                         return True
             return False
 
+        # module specifiers (import x from '../auth', require('./y'), import('./z')) are not URLs
+        _import_specs = set(re.findall(
+            r'''(?:\bfrom|\bimport|\brequire\s*\(|\bimport\s*\()\s*[\'"]([^\'"]+)[\'"]''', code))
+
         # LF Pattern 1: Relative paths starting with ../ or ./
         for m in re.finditer(r'["\']((\.\.?/)[^"\'><,;| *()%%$^\\[\]]{1}[^"\'><,;|()]{1,})["\']', code):
             url = m.group(1)
-            if _is_module_import(url):
+            if _is_module_import(url) or url in _import_specs:
                 continue
             if is_noise(url):
                 continue

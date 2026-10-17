@@ -13,6 +13,7 @@ import re
 from collections import defaultdict
 
 from shadow_scanner.core.evidence import is_runtime
+from shadow_scanner.core import diagnostics
 # ==============================================================================
 # CLASS: LIBRARY FINGERPRINT (Identify Vendor Code)
 # ==============================================================================
@@ -122,8 +123,8 @@ class EndpointClassifier:
             for _seg in _path.strip('/').split('/'):
                 if _unresolved_var_re.match(_seg):
                     return True
-        except Exception:
-            pass
+        except Exception as _exc:
+            diagnostics.swallowed(__name__, _exc)
         return False
 
 # ==============================================================================
@@ -166,6 +167,9 @@ class BayesianConfidenceScorer:
         # Next.js server manifest, GraphQL introspection). Replaced by learned
         # weights in Phase E.
         'schema_declared':    9.0,
+        # Provisional (Phase C): URL value-flow analysis (Babel sidecar). Replaced by learned
+        # weights in Phase E.
+        'value_flow':         8.0,
         'apq_persisted':      5.0,   # IMPL-6: APQ persisted queries
         'interceptor_base':   3.5,   # IMPL-2: axios interceptor baseURL
         'rtk_query':          5.5,   # G10: RTK Query / React Query / SWR
@@ -272,6 +276,7 @@ class BayesianConfidenceScorer:
         'TRPC_PROCEDURE':               ['trpc_procedure'],
         'TRPC_NESTED_PROCEDURE':        ['trpc_procedure'],
         'NUXT_SERVER_ROUTE':            ['nuxt_server_route'],
+        'VALUEFLOW_SINK':               ['value_flow'],
         'GQL_TAG_QUERY':                ['gql_tag'],          # client code
         'GQL_TAG_MUTATION':             ['gql_tag'],
         'GQL_TAG_SUBSCRIPTION':         ['gql_tag'],

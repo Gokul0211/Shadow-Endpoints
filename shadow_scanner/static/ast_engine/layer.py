@@ -8,6 +8,7 @@ from shadow_scanner.static.ast_engine.node_extractors import (
     ObjectExpressionExtractor,
     TemplateLiteralExtractor,
 )
+from shadow_scanner.core import diagnostics
 class ASTExtractionLayer:
     """
     Orchestrates all AST extractors, including the call-graph engine.
@@ -52,8 +53,8 @@ class ASTExtractionLayer:
             try:
                 found = extractor.extract(tree)
                 results.extend(found)
-            except Exception:
-                pass
+            except Exception as _exc:
+                diagnostics.swallowed(__name__, _exc)
 
         # ── True AST Call Graph extractor (ASTCallGraphExtractor) ──────────
         # Handles class/object/prototype method contexts with this-scope.
@@ -62,8 +63,8 @@ class ASTExtractionLayer:
                                                  known_vars=self.existing_bindings)
             cg_results = cg_extractor.extract(tree)
             results.extend(cg_results)
-        except Exception:
-            pass
+        except Exception as _exc:
+            diagnostics.swallowed(__name__, _exc)
 
         # ── ASTCallGraph — pure function-chain resolver (new) ───────────────
         # Resolves multi-level builder chains:
@@ -99,8 +100,8 @@ class ASTExtractionLayer:
                             'confidence_bonus': 4,
                         })
             results.extend(acg_http)
-        except Exception:
-            pass
+        except Exception as _exc:
+            diagnostics.swallowed(__name__, _exc)
 
         for ep in results:
             ep.setdefault('source', source_label)
